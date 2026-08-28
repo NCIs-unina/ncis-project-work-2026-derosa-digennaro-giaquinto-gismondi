@@ -23,7 +23,7 @@ class DosController(simple_switch_13.SimpleSwitch13):
     REQUIRED_HITS = 3
 
     # Mitigation duration.
-    BLOCK_SECONDS = 20
+    BLOCK_SECONDS = 60
 
     # Only ingress ports connected to clients are monitored.
     # Port 4 is the victim-facing port and is deliberately ignored.
