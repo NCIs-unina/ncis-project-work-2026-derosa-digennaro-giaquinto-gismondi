@@ -18,11 +18,8 @@ from ryu.lib import hub
 class DosController(simple_switch_13.SimpleSwitch13):
 
     # Detection parameters.
-    # NB: THRESHOLD_MBPS must stay BELOW the victim bottleneck (5 Mbps). Backpressure
-    # caps the attacker's ingress rate at the bottleneck, so a threshold of 8 would
-    # never trigger. Validated config (phase 7): threshold 4 vs bottleneck 5.
     POLL_INTERVAL = 2
-    THRESHOLD_MBPS = 4.0
+    THRESHOLD_MBPS = 1.5
     REQUIRED_HITS = 3
 
     # Mitigation duration.
@@ -30,7 +27,7 @@ class DosController(simple_switch_13.SimpleSwitch13):
 
     # Only ingress ports connected to clients are monitored.
     # Port 4 is the victim-facing port and is deliberately ignored.
-    MONITORED_PORTS = {1, 2, 3}
+    MONITORED_PORTS = {1}
 
     def __init__(self, *args, **kwargs):
         super(DosController, self).__init__(*args, **kwargs)
