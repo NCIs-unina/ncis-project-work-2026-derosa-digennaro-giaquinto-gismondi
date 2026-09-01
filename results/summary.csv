@@ -1,0 +1,4 @@
+scenario,ping_samples,rtt_avg_ms,rtt_max_ms,h2_receiver_mbps,h3_receiver_mbps,legit_total_mbps,h2_loss_pct,h3_loss_pct,attacker_receiver_mbps,attacker_loss_pct,attack_duration_s,detection_delay_s
+E1,60,0.127117,3.560000,2.000000,2.000000,4.000000,0.000000,0.000000,,,,
+E2,70,114.947043,339.000000,1.850000,1.890000,3.740000,0.000000,0.000000,2.050000,0.000000,15.000000,
+E3,70,91.341300,339.000000,2.000000,2.000000,4.000000,0.000000,0.000000,0.348000,0.000000,15.001436,5.549093
