@@ -33,6 +33,7 @@ from ryu.controller.handler import (
     set_ev_cls,
 )
 from ryu.lib import hub
+from ryu.lib.packet import packet, ipv4
 
 
 # ==========================================================================
@@ -129,11 +130,23 @@ class Mitigator:
     def __init__(self, logger):
         self.logger = logger
 
-    def install_drop(self, datapath, port, block_seconds):
+    def install_drop(self, datapath, port, block_seconds, ipv4_src=None):
         parser = datapath.ofproto_parser
 
-        # Tutto cio' che entra da questa porta viene scartato.
-        match = parser.OFPMatch(in_port=port)
+        if ipv4_src is not None:
+            # DROP mirato: solo il traffico IPv4 dell'host colpevole.
+            # Gli altri host sulla stessa porta NON vengono toccati.
+            match = parser.OFPMatch(
+                in_port=port,
+                eth_type=0x0800,        # IPv4
+                ipv4_src=ipv4_src,
+            )
+            target = "ip_src=%s (in_port=%d)" % (ipv4_src, port)
+        else:
+            # Fallback: sorgente non ancora nota -> blocco l'intera porta
+            # (comportamento della versione precedente).
+            match = parser.OFPMatch(in_port=port)
+            target = "in_port=%d" % port
 
         # Un FlowMod senza istruzioni scarta i pacchetti che fanno match.
         mod = parser.OFPFlowMod(
@@ -146,9 +159,9 @@ class Mitigator:
         datapath.send_msg(mod)
 
         self.logger.warning(
-            "ATTACK DETECTED: dpid=%s port=%d -> DROP for %d seconds",
+            "ATTACK DETECTED: dpid=%s %s -> DROP for %d seconds",
             datapath.id,
-            port,
+            target,
             block_seconds,
         )
 
@@ -187,6 +200,23 @@ class StatsLogger:
 
 
 # ==========================================================================
+# HostTable - impara quale IP sorgente sta su ciascuna porta.
+# Popolata dai packet-in; serve al Mitigator per il DROP mirato (Fase 2).
+# ==========================================================================
+class HostTable:
+
+    def __init__(self):
+        # (dpid, port) -> ultimo ipv4_src osservato su quella porta.
+        self._by_port = {}
+
+    def observe(self, key, ipv4_src):
+        self._by_port[key] = ipv4_src
+
+    def source_on(self, key):
+        return self._by_port.get(key)
+
+
+# ==========================================================================
 # DosController - app Ryu che ORCHESTRA i componenti.
 # ==========================================================================
 class DosController(simple_switch_13.SimpleSwitch13):
@@ -215,6 +245,7 @@ class DosController(simple_switch_13.SimpleSwitch13):
         self.blocklist = Blocklist()
         self.mitigator = Mitigator(self.logger)
         self.stats_log = StatsLogger(os.environ.get("RUN_ID", "manual"))
+        self.hosts = HostTable()
 
         # Avvio del monitoraggio periodico (green thread).
         self.monitor_thread = hub.spawn(self._monitor)
@@ -244,6 +275,21 @@ class DosController(simple_switch_13.SimpleSwitch13):
             if datapath.id in self.datapaths:
                 del self.datapaths[datapath.id]
                 self.logger.info("Unregistered datapath %016x", datapath.id)
+
+    # ---- packet-in: reachability (learning switch) + apprende gli IP ----
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        # 1) comportamento del learning switch (garantisce la connettivita').
+        super(DosController, self)._packet_in_handler(ev)
+
+        # 2) in piu': registra l'IP sorgente visto su questa porta,
+        #    cosi' il Mitigator puo' fare un DROP mirato sull'attaccante.
+        msg = ev.msg
+        in_port = msg.match["in_port"]
+        pkt = packet.Packet(msg.data)
+        ip = pkt.get_protocol(ipv4.ipv4)
+        if ip is not None:
+            self.hosts.observe((msg.datapath.id, in_port), ip.src)
 
     # ---- loop di monitoraggio periodico ----
     def _monitor(self):
@@ -292,8 +338,9 @@ class DosController(simple_switch_13.SimpleSwitch13):
         else:
             attack = self.detector.update(key, rx_mbps)
             if attack:
+                ipv4_src = self.hosts.source_on(key)
                 self.mitigator.install_drop(
-                    datapath, port, self.BLOCK_SECONDS,
+                    datapath, port, self.BLOCK_SECONDS, ipv4_src=ipv4_src,
                 )
                 self.blocklist.block(key, self.BLOCK_SECONDS, now_monotonic)
                 self.detector.reset(key)
