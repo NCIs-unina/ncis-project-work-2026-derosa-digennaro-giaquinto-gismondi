@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""
+DoS controller - versione modulare (Fase 1).
+
+Il COMPORTAMENTO e' identico alla versione precedente: stessi parametri,
+stessa logica di detection, stesso identico output CSV (consumato da
+experiments/parse_results.py). Cambia solo l'ORGANIZZAZIONE del codice,
+ora separato in componenti con responsabilita' singola:
+
+    TrafficMonitor -> raccolta statistiche e calcolo del rate di ingresso
+    Detector       -> decisione (soglia + campioni consecutivi)
+    Blocklist      -> stato condiviso delle porte bloccate
+    Mitigator      -> enforcement (installa la regola OpenFlow di DROP)
+    StatsLogger    -> log CSV
+    DosController  -> app Ryu che orchestra i componenti
+
+Questa separazione (Fase 1, risolve la "mancanza di modularita'") e' la base
+su cui si innestano i fix successivi senza toccare il resto:
+DROP mirato -> Mitigator, soglia adattiva -> Detector,
+blocklist verso l'esterno -> Blocklist.
+"""
 
 import csv
 import os
@@ -15,57 +35,188 @@ from ryu.controller.handler import (
 from ryu.lib import hub
 
 
+# ==========================================================================
+# Blocklist - stato condiviso delle porte bloccate.
+# (dpid, port) -> istante monotonic in cui il blocco termina.
+# Punto di estensione per la Fase 4 (blocklist condivisa verso l'esterno).
+# ==========================================================================
+class Blocklist:
+
+    def __init__(self):
+        self._blocked_until = {}
+
+    def block(self, key, seconds, now):
+        self._blocked_until[key] = now + seconds
+
+    def is_blocked(self, key, now):
+        return now < self._blocked_until.get(key, 0)
+
+
+# ==========================================================================
+# Detector - decide se una porta e' sotto attacco.
+# Conta i campioni consecutivi sopra soglia; scatta a REQUIRED_HITS.
+# Punto di estensione per la Fase 3 (soglia adattiva).
+# ==========================================================================
+class Detector:
+
+    def __init__(self, threshold_mbps, required_hits):
+        self.threshold_mbps = threshold_mbps
+        self.required_hits = required_hits
+        self._hits = {}
+
+    def update(self, key, rx_mbps):
+        """Aggiorna il contatore e ritorna True se e' ora di bloccare."""
+        if rx_mbps > self.threshold_mbps:
+            self._hits[key] = self._hits.get(key, 0) + 1
+        else:
+            self._hits[key] = 0
+        return self._hits[key] >= self.required_hits
+
+    def reset(self, key):
+        self._hits[key] = 0
+
+    def hits(self, key):
+        return self._hits.get(key, 0)
+
+
+# ==========================================================================
+# TrafficMonitor - raccolta statistiche e calcolo del rate di ingresso.
+# Conserva i contatori cumulativi precedenti per farne la differenza.
+# ==========================================================================
+class TrafficMonitor:
+
+    def __init__(self, monitored_ports):
+        self.monitored_ports = set(monitored_ports)
+        # (dpid, port) -> (rx_bytes_precedenti, timestamp monotonic)
+        self._previous = {}
+
+    def is_monitored(self, port):
+        return port in self.monitored_ports
+
+    def request_stats(self, datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        datapath.send_msg(req)
+
+    def rate_mbps(self, key, rx_bytes, now):
+        """Rate in Mbit/s dai byte cumulativi; None se non calcolabile."""
+        previous = self._previous.get(key)
+
+        # Salva sempre il contatore piu' recente.
+        self._previous[key] = (rx_bytes, now)
+
+        # Il primo campione non puo' produrre un rate.
+        if previous is None:
+            return None
+
+        prev_bytes, prev_time = previous
+        delta_bytes = rx_bytes - prev_bytes
+        delta_time = now - prev_time
+
+        if delta_bytes < 0 or delta_time <= 0:
+            return None
+
+        return delta_bytes * 8.0 / delta_time / 1_000_000.0
+
+
+# ==========================================================================
+# Mitigator - enforcement: installa la regola OpenFlow di DROP.
+# Punto di estensione per la Fase 2 (DROP mirato per flusso/ipv4_src).
+# ==========================================================================
+class Mitigator:
+
+    def __init__(self, logger):
+        self.logger = logger
+
+    def install_drop(self, datapath, port, block_seconds):
+        parser = datapath.ofproto_parser
+
+        # Tutto cio' che entra da questa porta viene scartato.
+        match = parser.OFPMatch(in_port=port)
+
+        # Un FlowMod senza istruzioni scarta i pacchetti che fanno match.
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=100,
+            match=match,
+            instructions=[],
+            hard_timeout=block_seconds,
+        )
+        datapath.send_msg(mod)
+
+        self.logger.warning(
+            "ATTACK DETECTED: dpid=%s port=%d -> DROP for %d seconds",
+            datapath.id,
+            port,
+            block_seconds,
+        )
+
+
+# ==========================================================================
+# StatsLogger - log CSV. Schema INVARIATO: e' letto da parse_results.py.
+# ==========================================================================
+class StatsLogger:
+
+    HEADER = [
+        "timestamp", "dpid", "port", "rx_mbps", "hits", "blocked", "action",
+    ]
+
+    def __init__(self, run_id):
+        project_root = Path(__file__).resolve().parents[1]
+        log_dir = project_root / "results" / "raw"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        self.path = log_dir / f"{run_id}_controller.csv"
+
+        if not self.path.exists():
+            with self.path.open("w", newline="") as f:
+                csv.writer(f).writerow(self.HEADER)
+
+    def log(self, timestamp, dpid, port, rx_mbps, hits, blocked, action):
+        with self.path.open("a", newline="") as f:
+            csv.writer(f).writerow([
+                f"{timestamp:.6f}",
+                dpid,
+                port,
+                f"{rx_mbps:.3f}",
+                hits,
+                int(blocked),
+                action,
+            ])
+
+
+# ==========================================================================
+# DosController - app Ryu che ORCHESTRA i componenti.
+# ==========================================================================
 class DosController(simple_switch_13.SimpleSwitch13):
 
-    # Detection parameters.
+    # Parametri di detection.
     POLL_INTERVAL = 2
     THRESHOLD_MBPS = 1.5
     REQUIRED_HITS = 3
 
-    # Mitigation duration.
+    # Durata della mitigazione.
     BLOCK_SECONDS = 20
 
-    # Only ingress ports connected to clients are monitored.
-    # Port 4 is the victim-facing port and is deliberately ignored.
+    # Solo le porte lato client vengono monitorate.
+    # La porta 4 (lato vittima) e' volutamente ignorata.
     MONITORED_PORTS = {1}
 
     def __init__(self, *args, **kwargs):
         super(DosController, self).__init__(*args, **kwargs)
 
-        # Connected OpenFlow switches.
+        # Switch OpenFlow connessi.
         self.datapaths = {}
 
-        # (dpid, port) -> (previous_rx_bytes, timestamp)
-        self.previous_stats = {}
+        # Componenti, ciascuno con una responsabilita' singola.
+        self.monitor = TrafficMonitor(self.MONITORED_PORTS)
+        self.detector = Detector(self.THRESHOLD_MBPS, self.REQUIRED_HITS)
+        self.blocklist = Blocklist()
+        self.mitigator = Mitigator(self.logger)
+        self.stats_log = StatsLogger(os.environ.get("RUN_ID", "manual"))
 
-        # Consecutive samples above threshold.
-        self.threshold_hits = {}
-
-        # (dpid, port) -> monotonic time at which blocking ends.
-        self.blocked_until = {}
-
-        # CSV log.
-        project_root = Path(__file__).resolve().parents[1]
-        log_dir = project_root / "results" / "raw"
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-        run_id = os.environ.get("RUN_ID", "manual")
-        self.log_path = log_dir / f"{run_id}_controller.csv"
-
-        if not self.log_path.exists():
-            with self.log_path.open("w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "timestamp",
-                    "dpid",
-                    "port",
-                    "rx_mbps",
-                    "hits",
-                    "blocked",
-                    "action",
-                ])
-
-        # Start periodic monitoring.
+        # Avvio del monitoraggio periodico (green thread).
         self.monitor_thread = hub.spawn(self._monitor)
 
         self.logger.info(
@@ -76,6 +227,7 @@ class DosController(simple_switch_13.SimpleSwitch13):
             self.BLOCK_SECONDS,
         )
 
+    # ---- registro dei datapath ----
     @set_ev_cls(
         ofp_event.EventOFPStateChange,
         [MAIN_DISPATCHER, DEAD_DISPATCHER],
@@ -86,42 +238,22 @@ class DosController(simple_switch_13.SimpleSwitch13):
         if ev.state == MAIN_DISPATCHER:
             if datapath.id not in self.datapaths:
                 self.datapaths[datapath.id] = datapath
-                self.logger.info(
-                    "Registered datapath %016x",
-                    datapath.id,
-                )
+                self.logger.info("Registered datapath %016x", datapath.id)
 
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapaths:
                 del self.datapaths[datapath.id]
-                self.logger.info(
-                    "Unregistered datapath %016x",
-                    datapath.id,
-                )
+                self.logger.info("Unregistered datapath %016x", datapath.id)
 
+    # ---- loop di monitoraggio periodico ----
     def _monitor(self):
         while True:
             for datapath in list(self.datapaths.values()):
-                self._request_port_stats(datapath)
-
+                self.monitor.request_stats(datapath)
             hub.sleep(self.POLL_INTERVAL)
 
-    def _request_port_stats(self, datapath):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        request = parser.OFPPortStatsRequest(
-            datapath,
-            0,
-            ofproto.OFPP_ANY,
-        )
-
-        datapath.send_msg(request)
-
-    @set_ev_cls(
-        ofp_event.EventOFPPortStatsReply,
-        MAIN_DISPATCHER,
-    )
+    # ---- ricezione delle statistiche di porta ----
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
         datapath = ev.msg.datapath
         dpid = datapath.id
@@ -132,85 +264,46 @@ class DosController(simple_switch_13.SimpleSwitch13):
         for stat in ev.msg.body:
             port = int(stat.port_no)
 
-            if port not in self.MONITORED_PORTS:
+            if not self.monitor.is_monitored(port):
                 continue
 
             key = (dpid, port)
+            rx_mbps = self.monitor.rate_mbps(key, stat.rx_bytes, now_monotonic)
 
-            previous = self.previous_stats.get(key)
-
-            # Always save the newest cumulative counter.
-            self.previous_stats[key] = (
-                stat.rx_bytes,
-                now_monotonic,
-            )
-
-            # First sample cannot produce a rate.
-            if previous is None:
+            # Primo campione o valore non valido: niente da decidere.
+            if rx_mbps is None:
                 continue
 
-            previous_bytes, previous_time = previous
-
-            delta_bytes = stat.rx_bytes - previous_bytes
-            delta_time = now_monotonic - previous_time
-
-            if delta_bytes < 0 or delta_time <= 0:
-                continue
-
-            rx_mbps = (
-                delta_bytes * 8.0 / delta_time / 1_000_000.0
+            self._handle_rate(
+                datapath, port, rx_mbps, now_epoch, now_monotonic,
             )
 
-            self._process_rate(
-                datapath=datapath,
-                port=port,
-                rx_mbps=rx_mbps,
-                timestamp=now_epoch,
-                now_monotonic=now_monotonic,
-            )
-
-    def _process_rate(
-        self,
-        datapath,
-        port,
-        rx_mbps,
-        timestamp,
-        now_monotonic,
-    ):
+    # ---- orchestrazione: detection -> mitigazione -> log ----
+    def _handle_rate(self, datapath, port, rx_mbps, timestamp, now_monotonic):
         key = (datapath.id, port)
 
-        block_end = self.blocked_until.get(key, 0)
-        blocked = now_monotonic < block_end
-
+        blocked = self.blocklist.is_blocked(key, now_monotonic)
         action = ""
 
         if blocked:
-            self.threshold_hits[key] = 0
+            # Blocco gia' attivo: azzera i campioni, non ridecidere.
+            self.detector.reset(key)
             action = "BLOCK_ACTIVE"
-
         else:
-            if rx_mbps > self.THRESHOLD_MBPS:
-                hits = self.threshold_hits.get(key, 0) + 1
-                self.threshold_hits[key] = hits
-            else:
-                self.threshold_hits[key] = 0
-
-            if self.threshold_hits[key] >= self.REQUIRED_HITS:
-                self._install_drop(datapath, port)
-
-                self.blocked_until[key] = (
-                    now_monotonic + self.BLOCK_SECONDS
+            attack = self.detector.update(key, rx_mbps)
+            if attack:
+                self.mitigator.install_drop(
+                    datapath, port, self.BLOCK_SECONDS,
                 )
-
-                self.threshold_hits[key] = 0
+                self.blocklist.block(key, self.BLOCK_SECONDS, now_monotonic)
+                self.detector.reset(key)
                 blocked = True
                 action = "DROP_INSTALLED"
 
-        hits = self.threshold_hits.get(key, 0)
+        hits = self.detector.hits(key)
 
         self.logger.info(
-            "PORT dpid=%s port=%d rate=%.2f Mbps "
-            "hits=%d blocked=%s action=%s",
+            "PORT dpid=%s port=%d rate=%.2f Mbps hits=%d blocked=%s action=%s",
             datapath.id,
             port,
             rx_mbps,
@@ -219,39 +312,6 @@ class DosController(simple_switch_13.SimpleSwitch13):
             action or "-",
         )
 
-        with self.log_path.open("a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                f"{timestamp:.6f}",
-                datapath.id,
-                port,
-                f"{rx_mbps:.3f}",
-                hits,
-                int(blocked),
-                action,
-            ])
-
-    def _install_drop(self, datapath, port):
-        parser = datapath.ofproto_parser
-
-        # Everything entering from this port is dropped.
-        match = parser.OFPMatch(in_port=port)
-
-        # A FlowMod with no instructions drops matching packets.
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=100,
-            match=match,
-            instructions=[],
-            hard_timeout=self.BLOCK_SECONDS,
-        )
-
-        datapath.send_msg(mod)
-
-        self.logger.warning(
-            "ATTACK DETECTED: dpid=%s port=%d -> "
-            "DROP for %d seconds",
-            datapath.id,
-            port,
-            self.BLOCK_SECONDS,
+        self.stats_log.log(
+            timestamp, datapath.id, port, rx_mbps, hits, blocked, action,
         )
