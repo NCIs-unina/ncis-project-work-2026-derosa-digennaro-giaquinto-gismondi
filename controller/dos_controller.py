@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Controller DoS - Fase M4: policy esterna tramite blocklist JSON condivisa.
+Controller DoS - Fase M5: sblocco automatico basato sul traffico.
 
-Evoluzione di M3:
+Evoluzione di M4:
 - detector adattivo EWMA invariato;
-- mitigazione automatica mirata per ipv4_src invariata;
-- aggiunge una blocklist esterna modificabile da un amministratore/modulo;
-- il controller rilegge periodicamente policy/blocklist.json;
-- aggiunte/rimozioni vengono tradotte in FlowMod persistenti e mirati.
+- DROP mirato per ipv4_src invariato;
+- blocklist amministrativa esterna invariata;
+- il DROP automatico NON usa piu' un hard_timeout fisso;
+- il controller osserva la porta host-facing della sorgente bloccata;
+- dopo QUIET_SAMPLES campioni consecutivi sotto UNBLOCK_RATE_MBPS,
+  rimuove esplicitamente il DROP con OFPFC_DELETE_STRICT.
 
-La policy esterna usa regole priority=110 e hard_timeout=0, distinte
-dalle mitigazioni automatiche priority=100 e hard_timeout=20.
-
-Formato del file:
-{
-  "blocked_ipv4": ["10.0.0.5"]
-}
+Le policy amministrative restano separate:
+- priority=110, persistenti finche' presenti nel JSON.
+Le mitigazioni automatiche M5:
+- priority=100, hard_timeout=0;
+- rimosse solo dalla logica di intelligent unblock.
 """
 
 import csv
@@ -161,14 +161,67 @@ class AdaptiveDetector:
 
 
 class Blocklist:
+    """
+    Stato delle mitigazioni automatiche attive.
+
+    detection_key = (dpid, port) dove e' stata rilevata l'anomalia.
+    Ogni entry conserva anche la porta host-facing della sorgente, che
+    viene usata per decidere quando rimuovere il DROP.
+    """
+
     def __init__(self):
-        self.blocked_until = {}
+        self.active = {}
 
-    def is_blocked(self, key, now_monotonic):
-        return now_monotonic < self.blocked_until.get(key, 0)
+    def is_blocked(self, detection_key):
+        return detection_key in self.active
 
-    def block_for(self, key, seconds, now_monotonic):
-        self.blocked_until[key] = now_monotonic + seconds
+    def block(
+        self,
+        detection_key,
+        ipv4_src,
+        source_key,
+        switch_dpid,
+        ingress_port,
+    ):
+        self.active[detection_key] = {
+            "ipv4_src": ipv4_src,
+            "source_key": source_key,
+            "switch_dpid": switch_dpid,
+            "ingress_port": ingress_port,
+            "quiet_hits": 0,
+            "last_source_rate": None,
+        }
+
+    def observe_source_rate(
+        self,
+        source_key,
+        source_rate_mbps,
+        quiet_threshold_mbps,
+        quiet_samples,
+    ):
+        ready = []
+
+        for detection_key, entry in list(self.active.items()):
+            if entry["source_key"] != source_key:
+                continue
+
+            entry["last_source_rate"] = source_rate_mbps
+
+            if source_rate_mbps <= quiet_threshold_mbps:
+                entry["quiet_hits"] += 1
+            else:
+                entry["quiet_hits"] = 0
+
+            if entry["quiet_hits"] >= quiet_samples:
+                ready.append((detection_key, dict(entry)))
+
+        return ready
+
+    def remove(self, detection_key):
+        return self.active.pop(detection_key, None)
+
+    def get(self, detection_key):
+        return self.active.get(detection_key)
 
 
 class SourceTracker:
@@ -254,7 +307,6 @@ class Mitigator:
         datapath,
         ingress_port,
         ipv4_src,
-        block_seconds,
         source_key,
         source_rate_mbps,
     ):
@@ -271,7 +323,8 @@ class Mitigator:
             priority=100,
             match=match,
             instructions=[],
-            hard_timeout=block_seconds,
+            hard_timeout=0,
+            idle_timeout=0,
         )
 
         datapath.send_msg(mod)
@@ -279,14 +332,49 @@ class Mitigator:
         self.logger.warning(
             "ATTACK DETECTED: dpid=%s port=%d "
             "source=%s learned_at=(dpid=%s,port=%s) "
-            "source_rate=%.2f Mbps -> TARGETED DROP for %d seconds",
+            "source_rate=%.2f Mbps -> TARGETED DROP until traffic is quiet",
             datapath.id,
             ingress_port,
             ipv4_src,
             source_key[0],
             source_key[1],
             source_rate_mbps,
-            block_seconds,
+        )
+
+    def remove_targeted_drop(
+        self,
+        datapath,
+        ingress_port,
+        ipv4_src,
+        priority=100,
+    ):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        match = parser.OFPMatch(
+            in_port=ingress_port,
+            eth_type=0x0800,
+            ipv4_src=ipv4_src,
+        )
+
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE_STRICT,
+            table_id=0,
+            priority=priority,
+            match=match,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+        )
+
+        datapath.send_msg(mod)
+
+        self.logger.warning(
+            "AUTO UNBLOCK: source=%s -> dpid=%s port=%d "
+            "targeted DROP removed after quiet traffic",
+            ipv4_src,
+            datapath.id,
+            ingress_port,
         )
 
     def install_admin_drop(
@@ -615,7 +703,11 @@ class DosController(simple_switch_13.SimpleSwitch13):
     TRAINING_MIN_MBPS = 0.1
 
     REQUIRED_HITS = 3
-    BLOCK_SECONDS = 20
+
+    # M5 intelligent unblock: 3 campioni consecutivi <= 0.1 Mbit/s.
+    UNBLOCK_RATE_MBPS = 0.1
+    UNBLOCK_QUIET_SAMPLES = 3
+
     MONITORED_PORTS = {1}
 
     def __init__(self, *args, **kwargs):
@@ -665,13 +757,19 @@ class DosController(simple_switch_13.SimpleSwitch13):
         self.logger.info(
             "DoS controller started: adaptive threshold, "
             "min=%.1f Mbps, multiplier=%.2f, alpha=%.2f, "
-            "training=%d active samples, required_hits=%d, block=%ds",
+            "training=%d active samples, required_hits=%d",
             self.MIN_THRESHOLD_MBPS,
             self.THRESHOLD_MULTIPLIER,
             self.EWMA_ALPHA,
             self.TRAINING_SAMPLES,
             self.REQUIRED_HITS,
-            self.BLOCK_SECONDS,
+        )
+
+        self.logger.info(
+            "Intelligent unblock enabled: source_rate<=%.3f Mbps "
+            "for %d consecutive samples",
+            self.UNBLOCK_RATE_MBPS,
+            self.UNBLOCK_QUIET_SAMPLES,
         )
 
         self.logger.info(
@@ -777,6 +875,14 @@ class DosController(simple_switch_13.SimpleSwitch13):
             if rx_mbps is None:
                 continue
 
+            # M5: le porte host-facing delle sorgenti bloccate vengono
+            # osservate anche se non sono porte di detection.
+            self._evaluate_intelligent_unblock(
+                source_key=key,
+                source_rate_mbps=rx_mbps,
+                timestamp=now_epoch,
+            )
+
             if not self.monitor.is_detection_port(port):
                 continue
 
@@ -786,6 +892,72 @@ class DosController(simple_switch_13.SimpleSwitch13):
                 rx_mbps=rx_mbps,
                 timestamp=now_epoch,
                 now_monotonic=now_monotonic,
+            )
+
+    def _evaluate_intelligent_unblock(
+        self,
+        source_key,
+        source_rate_mbps,
+        timestamp,
+    ):
+        ready = self.blocklist.observe_source_rate(
+            source_key=source_key,
+            source_rate_mbps=source_rate_mbps,
+            quiet_threshold_mbps=self.UNBLOCK_RATE_MBPS,
+            quiet_samples=self.UNBLOCK_QUIET_SAMPLES,
+        )
+
+        for detection_key, entry in ready:
+            datapath = self.datapaths.get(
+                entry["switch_dpid"]
+            )
+
+            if datapath is None:
+                continue
+
+            self.mitigator.remove_targeted_drop(
+                datapath=datapath,
+                ingress_port=entry["ingress_port"],
+                ipv4_src=entry["ipv4_src"],
+                priority=100,
+            )
+
+            self.blocklist.remove(detection_key)
+            self.detector.reset_hits(detection_key)
+
+            detection_rate = self.monitor.latest_rates.get(
+                detection_key,
+                0.0,
+            )
+
+            self.stats_logger.write(
+                timestamp=timestamp,
+                dpid=detection_key[0],
+                port=detection_key[1],
+                rx_mbps=detection_rate,
+                hits=0,
+                blocked=False,
+                action="DROP_REMOVED",
+                baseline_mbps=self.detector.baseline(
+                    detection_key
+                ),
+                threshold_mbps=self.detector.threshold(
+                    detection_key
+                ),
+                training_count=self.detector.training_count(
+                    detection_key
+                ),
+                trained=self.detector.is_trained(
+                    detection_key
+                ),
+            )
+
+            self.logger.warning(
+                "AUTO UNBLOCK COMPLETE: source=%s "
+                "source_rate=%.3f Mbps quiet_samples=%d",
+                entry["ipv4_src"],
+                source_rate_mbps,
+                self.UNBLOCK_QUIET_SAMPLES,
             )
 
     def _process_rate(
@@ -798,7 +970,7 @@ class DosController(simple_switch_13.SimpleSwitch13):
     ):
         key = (datapath.id, port)
 
-        blocked = self.blocklist.is_blocked(key, now_monotonic)
+        blocked = self.blocklist.is_blocked(key)
         action = ""
 
         if blocked:
@@ -844,15 +1016,16 @@ class DosController(simple_switch_13.SimpleSwitch13):
                         datapath=datapath,
                         ingress_port=port,
                         ipv4_src=offender["ip"],
-                        block_seconds=self.BLOCK_SECONDS,
                         source_key=offender["source_key"],
                         source_rate_mbps=offender["rate_mbps"],
                     )
 
-                    self.blocklist.block_for(
-                        key,
-                        self.BLOCK_SECONDS,
-                        now_monotonic,
+                    self.blocklist.block(
+                        detection_key=key,
+                        ipv4_src=offender["ip"],
+                        source_key=offender["source_key"],
+                        switch_dpid=datapath.id,
+                        ingress_port=port,
                     )
 
                     self.detector.reset_hits(key)
