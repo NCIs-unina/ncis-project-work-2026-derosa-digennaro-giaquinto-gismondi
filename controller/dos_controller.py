@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-Controller DoS - Fase M2: mitigazione mirata per risolvere l'over-blocking.
+Controller DoS - Fase M3: soglia adattiva con training benigno + EWMA.
 
-M1 resta invariata per:
-- polling PortStats ogni 2 s;
-- soglia statica 1.5 Mbit/s;
-- 3 campioni consecutivi sopra soglia;
-- hard_timeout 20 s;
-- schema CSV.
+Evoluzione di M2:
+- mitigazione mirata per ipv4_src invariata;
+- niente threshold fisso come unico criterio di decisione;
+- ogni porta di detection costruisce una baseline da campioni di traffico attivo;
+- dopo il training, la baseline viene aggiornata con EWMA solo sui campioni
+  classificati come normali;
+- se un campione supera la soglia adattiva, la baseline viene congelata:
+  l'attacco non puo' trascinare verso l'alto la soglia.
 
-M2 aggiunge:
-- raccolta del rate su tutte le porte fisiche;
-- SourceTracker: associa le sorgenti IP/MAC osservate alle porte;
-- SourceSelector: quando l'uplink monitorato supera la soglia, individua
-  la sorgente con il rate di ingresso più alto su una porta host-facing;
-- Mitigator: installa su s1 un DROP mirato a ipv4_src, non all'intera porta.
+Formula:
+    baseline_t = alpha * rate_t + (1-alpha) * baseline_(t-1)
 
-Nessuna soglia adattiva, blocklist esterna o unblock intelligente:
-queste appartengono alle fasi successive.
+    threshold_t = max(MIN_THRESHOLD_MBPS,
+                      THRESHOLD_MULTIPLIER * baseline_t)
+
+Parametri M3:
+- POLL_INTERVAL = 2 s
+- REQUIRED_HITS = 3
+- BLOCK_SECONDS = 20 s
+- TRAINING_SAMPLES = 5 campioni attivi
+- TRAINING_MIN_MBPS = 0.1 Mbit/s
+- EWMA_ALPHA = 0.2
+- THRESHOLD_MULTIPLIER = 1.5
+- MIN_THRESHOLD_MBPS = 1.5 Mbit/s
 """
 
 import csv
@@ -27,18 +35,12 @@ from pathlib import Path
 
 from ryu.app import simple_switch_13
 from ryu.controller import ofp_event
-from ryu.controller.handler import (
-    MAIN_DISPATCHER,
-    DEAD_DISPATCHER,
-    set_ev_cls,
-)
+from ryu.controller.handler import MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
 from ryu.lib import hub
 from ryu.lib.packet import packet, ethernet, arp, ipv4
 
 
 class TrafficMonitor:
-    """Calcola il rate RX delle porte fisiche e conserva l'ultimo rate."""
-
     def __init__(self, monitored_ports):
         self.monitored_ports = set(monitored_ports)
         self.previous_stats = {}
@@ -50,20 +52,12 @@ class TrafficMonitor:
     def request_port_stats(self, datapath):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        request = parser.OFPPortStatsRequest(
-            datapath,
-            0,
-            ofproto.OFPP_ANY,
-        )
+        request = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(request)
 
     def calculate_rate_mbps(self, key, rx_bytes, now_monotonic):
         previous = self.previous_stats.get(key)
-        self.previous_stats[key] = (
-            rx_bytes,
-            now_monotonic,
-        )
+        self.previous_stats[key] = (rx_bytes, now_monotonic)
 
         if previous is None:
             return None
@@ -75,69 +69,117 @@ class TrafficMonitor:
         if delta_bytes < 0 or delta_time <= 0:
             return None
 
-        rx_mbps = (
-            delta_bytes * 8.0 / delta_time / 1_000_000.0
-        )
+        rx_mbps = delta_bytes * 8.0 / delta_time / 1_000_000.0
         self.latest_rates[key] = rx_mbps
         return rx_mbps
 
-    def get_rate(self, key):
-        return self.latest_rates.get(key)
 
-
-class Detector:
-    """Stessa detection di M1: soglia statica + hit consecutivi."""
-
-    def __init__(self, threshold_mbps, required_hits):
-        self.threshold_mbps = threshold_mbps
+class AdaptiveDetector:
+    def __init__(
+        self,
+        required_hits,
+        min_threshold_mbps,
+        threshold_multiplier,
+        ewma_alpha,
+        training_samples,
+        training_min_mbps,
+    ):
         self.required_hits = required_hits
-        self.threshold_hits = {}
+        self.min_threshold_mbps = min_threshold_mbps
+        self.threshold_multiplier = threshold_multiplier
+        self.ewma_alpha = ewma_alpha
+        self.training_samples = training_samples
+        self.training_min_mbps = training_min_mbps
 
-    def observe(self, key, rx_mbps):
-        if rx_mbps > self.threshold_mbps:
-            self.threshold_hits[key] = (
-                self.threshold_hits.get(key, 0) + 1
-            )
-        else:
-            self.threshold_hits[key] = 0
+        self._training_values = {}
+        self._baseline = {}
+        self._trained = set()
+        self._hits = {}
 
-        return (
-            self.threshold_hits[key] >= self.required_hits
+    def is_trained(self, key):
+        return key in self._trained
+
+    def training_count(self, key):
+        return len(self._training_values.get(key, []))
+
+    def baseline(self, key):
+        return self._baseline.get(key)
+
+    def threshold(self, key):
+        baseline = self.baseline(key)
+        if baseline is None:
+            return self.min_threshold_mbps
+
+        return max(
+            self.min_threshold_mbps,
+            self.threshold_multiplier * baseline,
         )
 
-    def reset(self, key):
-        self.threshold_hits[key] = 0
-
     def get_hits(self, key):
-        return self.threshold_hits.get(key, 0)
+        return self._hits.get(key, 0)
+
+    def reset_hits(self, key):
+        self._hits[key] = 0
+
+    def observe(self, key, rx_mbps):
+        if not self.is_trained(key):
+            self._hits[key] = 0
+
+            if rx_mbps >= self.training_min_mbps:
+                values = self._training_values.setdefault(key, [])
+                values.append(rx_mbps)
+                self._baseline[key] = sum(values) / len(values)
+
+                if len(values) >= self.training_samples:
+                    self._trained.add(key)
+
+            return {
+                "attack": False,
+                "trained": self.is_trained(key),
+                "training_count": self.training_count(key),
+                "baseline_mbps": self.baseline(key),
+                "threshold_mbps": self.threshold(key),
+                "hits": 0,
+            }
+
+        current_threshold = self.threshold(key)
+
+        if rx_mbps > current_threshold:
+            self._hits[key] = self._hits.get(key, 0) + 1
+        else:
+            self._hits[key] = 0
+
+            # I campioni idle/quasi-zero non cancellano la baseline
+            # benigna appresa durante il training.
+            if rx_mbps >= self.training_min_mbps:
+                old_baseline = self._baseline[key]
+                self._baseline[key] = (
+                    self.ewma_alpha * rx_mbps
+                    + (1.0 - self.ewma_alpha) * old_baseline
+                )
+
+        return {
+            "attack": self._hits.get(key, 0) >= self.required_hits,
+            "trained": True,
+            "training_count": self.training_count(key),
+            "baseline_mbps": self.baseline(key),
+            "threshold_mbps": self.threshold(key),
+            "hits": self.get_hits(key),
+        }
 
 
 class Blocklist:
-    """Stesso stato temporaneo di M1, ancora legato alla detection key."""
-
     def __init__(self):
         self.blocked_until = {}
 
     def is_blocked(self, key, now_monotonic):
-        return (
-            now_monotonic
-            < self.blocked_until.get(key, 0)
-        )
+        return now_monotonic < self.blocked_until.get(key, 0)
 
     def block_for(self, key, seconds, now_monotonic):
-        self.blocked_until[key] = (
-            now_monotonic + seconds
-        )
+        self.blocked_until[key] = now_monotonic + seconds
 
 
 class SourceTracker:
-    """
-    Tiene traccia delle sorgenti osservate tramite PacketIn.
-
-    Per ogni (dpid, in_port) conserva IP -> MAC.
-    Le porte con una sola sorgente appresa sono buoni candidati host-facing.
-    """
-
     def __init__(self):
         self.sources_by_port = {}
 
@@ -145,50 +187,33 @@ class SourceTracker:
         if not src_ip or not src_mac:
             return
 
-        sources = self.sources_by_port.setdefault(
-            key,
-            {},
-        )
+        sources = self.sources_by_port.setdefault(key, {})
         sources[src_ip] = src_mac
 
     def single_source(self, key):
         sources = self.sources_by_port.get(key, {})
-
         if len(sources) != 1:
             return None
 
         src_ip, src_mac = next(iter(sources.items()))
-        return {
-            "ip": src_ip,
-            "mac": src_mac,
-        }
+        return {"ip": src_ip, "mac": src_mac}
 
 
 class SourceSelector:
-    """
-    Seleziona la sorgente più plausibile dell'attacco.
-
-    Quando la detection avviene su un uplink aggregato, cerca tra le altre
-    porte fisiche una porta con una sola sorgente appresa e sceglie quella
-    con il rate RX più alto sopra la soglia.
-
-    Nella topologia M2:
-      s1-eth1 = uplink condiviso h1+h5
-      s2-eth2 = h1
-      s2-eth3 = h5
-    """
-
-    def __init__(self, minimum_rate_mbps):
-        self.minimum_rate_mbps = minimum_rate_mbps
-
-    def select(self, detected_key, monitor, source_tracker):
+    def select(
+        self,
+        detected_key,
+        monitor,
+        source_tracker,
+        minimum_rate_mbps,
+    ):
         candidates = []
 
         for key, rate in monitor.latest_rates.items():
             if key == detected_key:
                 continue
 
-            if rate <= self.minimum_rate_mbps:
+            if rate <= minimum_rate_mbps:
                 continue
 
             source = source_tracker.single_source(key)
@@ -205,15 +230,10 @@ class SourceSelector:
         if not candidates:
             return None
 
-        return max(
-            candidates,
-            key=lambda candidate: candidate["rate_mbps"],
-        )
+        return max(candidates, key=lambda candidate: candidate["rate_mbps"])
 
 
 class Mitigator:
-    """Installa un DROP IPv4 mirato alla sorgente identificata."""
-
     def __init__(self, logger):
         self.logger = logger
 
@@ -259,8 +279,6 @@ class Mitigator:
 
 
 class StatsLogger:
-    """Mantiene lo schema CSV usato nelle fasi precedenti."""
-
     HEADER = [
         "timestamp",
         "dpid",
@@ -269,6 +287,10 @@ class StatsLogger:
         "hits",
         "blocked",
         "action",
+        "baseline_mbps",
+        "threshold_mbps",
+        "training_count",
+        "trained",
     ]
 
     def __init__(self, run_id):
@@ -276,13 +298,17 @@ class StatsLogger:
         log_dir = project_root / "results" / "raw"
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        self.log_path = (
-            log_dir / f"{run_id}_controller.csv"
-        )
+        self.log_path = log_dir / f"{run_id}_controller.csv"
 
         if not self.log_path.exists():
             with self.log_path.open("w", newline="") as f:
                 csv.writer(f).writerow(self.HEADER)
+
+    @staticmethod
+    def _fmt_optional(value):
+        if value is None:
+            return ""
+        return f"{value:.3f}"
 
     def write(
         self,
@@ -293,6 +319,10 @@ class StatsLogger:
         hits,
         blocked,
         action,
+        baseline_mbps,
+        threshold_mbps,
+        training_count,
+        trained,
     ):
         with self.log_path.open("a", newline="") as f:
             csv.writer(f).writerow([
@@ -303,57 +333,61 @@ class StatsLogger:
                 hits,
                 int(blocked),
                 action,
+                self._fmt_optional(baseline_mbps),
+                self._fmt_optional(threshold_mbps),
+                training_count,
+                int(trained),
             ])
 
 
 class DosController(simple_switch_13.SimpleSwitch13):
     POLL_INTERVAL = 2
-    THRESHOLD_MBPS = 1.5
+
+    MIN_THRESHOLD_MBPS = 1.5
+    THRESHOLD_MULTIPLIER = 1.5
+    EWMA_ALPHA = 0.2
+    TRAINING_SAMPLES = 5
+    TRAINING_MIN_MBPS = 0.1
+
     REQUIRED_HITS = 3
     BLOCK_SECONDS = 20
-
-    # Detection ancora sulla porta numero 1.
-    # Nella topologia M2 s2 non usa la porta 1, quindi la detection
-    # avviene sull'uplink condiviso s1-eth1.
     MONITORED_PORTS = {1}
 
     def __init__(self, *args, **kwargs):
-        super(DosController, self).__init__(
-            *args,
-            **kwargs,
-        )
+        super(DosController, self).__init__(*args, **kwargs)
 
         self.datapaths = {}
 
-        self.monitor = TrafficMonitor(
-            self.MONITORED_PORTS
+        self.monitor = TrafficMonitor(self.MONITORED_PORTS)
+
+        self.detector = AdaptiveDetector(
+            required_hits=self.REQUIRED_HITS,
+            min_threshold_mbps=self.MIN_THRESHOLD_MBPS,
+            threshold_multiplier=self.THRESHOLD_MULTIPLIER,
+            ewma_alpha=self.EWMA_ALPHA,
+            training_samples=self.TRAINING_SAMPLES,
+            training_min_mbps=self.TRAINING_MIN_MBPS,
         )
-        self.detector = Detector(
-            self.THRESHOLD_MBPS,
-            self.REQUIRED_HITS,
-        )
+
         self.blocklist = Blocklist()
         self.source_tracker = SourceTracker()
-        self.source_selector = SourceSelector(
-            self.THRESHOLD_MBPS
-        )
+        self.source_selector = SourceSelector()
         self.mitigator = Mitigator(self.logger)
 
-        run_id = os.environ.get(
-            "RUN_ID",
-            "manual",
-        )
+        run_id = os.environ.get("RUN_ID", "manual")
         self.stats_logger = StatsLogger(run_id)
         self.log_path = self.stats_logger.log_path
 
-        self.monitor_thread = hub.spawn(
-            self._monitor
-        )
+        self.monitor_thread = hub.spawn(self._monitor)
 
         self.logger.info(
-            "DoS controller started: threshold=%.1f Mbps, "
-            "required_hits=%d, block=%ds, mitigation=targeted-ipv4-src",
-            self.THRESHOLD_MBPS,
+            "DoS controller started: adaptive threshold, "
+            "min=%.1f Mbps, multiplier=%.2f, alpha=%.2f, "
+            "training=%d active samples, required_hits=%d, block=%ds",
+            self.MIN_THRESHOLD_MBPS,
+            self.THRESHOLD_MULTIPLIER,
+            self.EWMA_ALPHA,
+            self.TRAINING_SAMPLES,
             self.REQUIRED_HITS,
             self.BLOCK_SECONDS,
         )
@@ -368,40 +402,24 @@ class DosController(simple_switch_13.SimpleSwitch13):
         if ev.state == MAIN_DISPATCHER:
             if datapath.id not in self.datapaths:
                 self.datapaths[datapath.id] = datapath
-                self.logger.info(
-                    "Registered datapath %016x",
-                    datapath.id,
-                )
+                self.logger.info("Registered datapath %016x", datapath.id)
 
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapaths:
                 del self.datapaths[datapath.id]
-                self.logger.info(
-                    "Unregistered datapath %016x",
-                    datapath.id,
-                )
+                self.logger.info("Unregistered datapath %016x", datapath.id)
 
-    @set_ev_cls(
-        ofp_event.EventOFPPacketIn,
-        MAIN_DISPATCHER,
-    )
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        # Mantiene il comportamento learning-switch di Ryu.
         super(DosController, self)._packet_in_handler(ev)
 
         msg = ev.msg
         in_port = msg.match["in_port"]
 
         pkt = packet.Packet(msg.data)
-        eth_pkt = pkt.get_protocol(
-            ethernet.ethernet
-        )
-        arp_pkt = pkt.get_protocol(
-            arp.arp
-        )
-        ipv4_pkt = pkt.get_protocol(
-            ipv4.ipv4
-        )
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        arp_pkt = pkt.get_protocol(arp.arp)
+        ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
 
         if eth_pkt is None:
             return
@@ -422,19 +440,12 @@ class DosController(simple_switch_13.SimpleSwitch13):
 
     def _monitor(self):
         while True:
-            for datapath in list(
-                self.datapaths.values()
-            ):
-                self.monitor.request_port_stats(
-                    datapath
-                )
+            for datapath in list(self.datapaths.values()):
+                self.monitor.request_port_stats(datapath)
 
             hub.sleep(self.POLL_INTERVAL)
 
-    @set_ev_cls(
-        ofp_event.EventOFPPortStatsReply,
-        MAIN_DISPATCHER,
-    )
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
         datapath = ev.msg.datapath
         dpid = datapath.id
@@ -446,25 +457,20 @@ class DosController(simple_switch_13.SimpleSwitch13):
         for stat in ev.msg.body:
             port = int(stat.port_no)
 
-            # Ignora porte OpenFlow riservate (LOCAL, CONTROLLER, ecc.).
             if port >= ofproto.OFPP_MAX:
                 continue
 
             key = (dpid, port)
 
-            rx_mbps = (
-                self.monitor.calculate_rate_mbps(
-                    key,
-                    stat.rx_bytes,
-                    now_monotonic,
-                )
+            rx_mbps = self.monitor.calculate_rate_mbps(
+                key,
+                stat.rx_bytes,
+                now_monotonic,
             )
 
             if rx_mbps is None:
                 continue
 
-            # Il rate viene calcolato per tutte le porte fisiche,
-            # ma la detection scatta solo sulle porte monitorate.
             if not self.monitor.is_detection_port(port):
                 continue
 
@@ -486,38 +492,42 @@ class DosController(simple_switch_13.SimpleSwitch13):
     ):
         key = (datapath.id, port)
 
-        blocked = self.blocklist.is_blocked(
-            key,
-            now_monotonic,
-        )
+        blocked = self.blocklist.is_blocked(key, now_monotonic)
         action = ""
 
         if blocked:
-            self.detector.reset(key)
+            self.detector.reset_hits(key)
+
+            status = {
+                "attack": False,
+                "trained": self.detector.is_trained(key),
+                "training_count": self.detector.training_count(key),
+                "baseline_mbps": self.detector.baseline(key),
+                "threshold_mbps": self.detector.threshold(key),
+                "hits": 0,
+            }
+
             action = "BLOCK_ACTIVE"
 
         else:
-            attack_detected = self.detector.observe(
-                key,
-                rx_mbps,
-            )
+            status = self.detector.observe(key, rx_mbps)
 
-            if attack_detected:
+            if status["attack"]:
                 offender = self.source_selector.select(
-                    key,
-                    self.monitor,
-                    self.source_tracker,
+                    detected_key=key,
+                    monitor=self.monitor,
+                    source_tracker=self.source_tracker,
+                    minimum_rate_mbps=self.TRAINING_MIN_MBPS,
                 )
 
                 if offender is None:
-                    # M2 NON torna al vecchio DROP dell'intera porta:
-                    # se non sappiamo chi è la sorgente, non over-blockiamo.
-                    self.detector.reset(key)
+                    self.detector.reset_hits(key)
+                    status["hits"] = 0
                     action = "TARGET_NOT_FOUND"
 
                     self.logger.warning(
-                        "Attack-like rate on dpid=%s port=%d, "
-                        "but no unique high-rate source was identified; "
+                        "Adaptive detector triggered on dpid=%s port=%d "
+                        "but no high-rate unique source was identified; "
                         "no broad DROP installed",
                         datapath.id,
                         port,
@@ -539,29 +549,42 @@ class DosController(simple_switch_13.SimpleSwitch13):
                         now_monotonic,
                     )
 
-                    self.detector.reset(key)
+                    self.detector.reset_hits(key)
+                    status["hits"] = 0
                     blocked = True
                     action = "DROP_INSTALLED"
 
-        hits = self.detector.get_hits(key)
-
         self.logger.info(
             "PORT dpid=%s port=%d rate=%.2f Mbps "
-            "hits=%d blocked=%s action=%s",
+            "baseline=%s threshold=%.2f trained=%s "
+            "training=%d/%d hits=%d blocked=%s action=%s",
             datapath.id,
             port,
             rx_mbps,
-            hits,
+            (
+                "%.2f" % status["baseline_mbps"]
+                if status["baseline_mbps"] is not None
+                else "-"
+            ),
+            status["threshold_mbps"],
+            status["trained"],
+            status["training_count"],
+            self.TRAINING_SAMPLES,
+            status["hits"],
             blocked,
             action or "-",
         )
 
         self.stats_logger.write(
-            timestamp,
-            datapath.id,
-            port,
-            rx_mbps,
-            hits,
-            blocked,
-            action,
+            timestamp=timestamp,
+            dpid=datapath.id,
+            port=port,
+            rx_mbps=rx_mbps,
+            hits=status["hits"],
+            blocked=blocked,
+            action=action,
+            baseline_mbps=status["baseline_mbps"],
+            threshold_mbps=status["threshold_mbps"],
+            training_count=status["training_count"],
+            trained=status["trained"],
         )
