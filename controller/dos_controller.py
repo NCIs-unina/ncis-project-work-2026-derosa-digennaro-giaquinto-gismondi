@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 """
-Controller DoS - Fase M3: soglia adattiva con training benigno + EWMA.
+Controller DoS - Fase M4: policy esterna tramite blocklist JSON condivisa.
 
-Evoluzione di M2:
-- mitigazione mirata per ipv4_src invariata;
-- niente threshold fisso come unico criterio di decisione;
-- ogni porta di detection costruisce una baseline da campioni di traffico attivo;
-- dopo il training, la baseline viene aggiornata con EWMA solo sui campioni
-  classificati come normali;
-- se un campione supera la soglia adattiva, la baseline viene congelata:
-  l'attacco non puo' trascinare verso l'alto la soglia.
+Evoluzione di M3:
+- detector adattivo EWMA invariato;
+- mitigazione automatica mirata per ipv4_src invariata;
+- aggiunge una blocklist esterna modificabile da un amministratore/modulo;
+- il controller rilegge periodicamente policy/blocklist.json;
+- aggiunte/rimozioni vengono tradotte in FlowMod persistenti e mirati.
 
-Formula:
-    baseline_t = alpha * rate_t + (1-alpha) * baseline_(t-1)
+La policy esterna usa regole priority=110 e hard_timeout=0, distinte
+dalle mitigazioni automatiche priority=100 e hard_timeout=20.
 
-    threshold_t = max(MIN_THRESHOLD_MBPS,
-                      THRESHOLD_MULTIPLIER * baseline_t)
-
-Parametri M3:
-- POLL_INTERVAL = 2 s
-- REQUIRED_HITS = 3
-- BLOCK_SECONDS = 20 s
-- TRAINING_SAMPLES = 5 campioni attivi
-- TRAINING_MIN_MBPS = 0.1 Mbit/s
-- EWMA_ALPHA = 0.2
-- THRESHOLD_MULTIPLIER = 1.5
-- MIN_THRESHOLD_MBPS = 1.5 Mbit/s
+Formato del file:
+{
+  "blocked_ipv4": ["10.0.0.5"]
+}
 """
 
 import csv
+import ipaddress
+import json
 import os
 import time
 from pathlib import Path
@@ -198,6 +190,26 @@ class SourceTracker:
         src_ip, src_mac = next(iter(sources.items()))
         return {"ip": src_ip, "mac": src_mac}
 
+    def find_single_source_location(self, ipv4_src):
+        """
+        Restituisce una porta in cui ipv4_src e' l'unica sorgente appresa.
+
+        Nella topologia M2/M4, dopo pingall:
+        - h1 -> (dpid=2, port=2)
+        - h5 -> (dpid=2, port=3)
+        mentre l'uplink s1-eth1 contiene piu' sorgenti e viene escluso.
+        """
+        candidates = []
+
+        for key, sources in self.sources_by_port.items():
+            if ipv4_src in sources and len(sources) == 1:
+                candidates.append(key)
+
+        if not candidates:
+            return None
+
+        return sorted(candidates)[0]
+
 
 class SourceSelector:
     def select(
@@ -277,6 +289,257 @@ class Mitigator:
             block_seconds,
         )
 
+    def install_admin_drop(
+        self,
+        datapath,
+        ingress_port,
+        ipv4_src,
+        priority,
+    ):
+        parser = datapath.ofproto_parser
+
+        match = parser.OFPMatch(
+            in_port=ingress_port,
+            eth_type=0x0800,
+            ipv4_src=ipv4_src,
+        )
+
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            instructions=[],
+            hard_timeout=0,
+            idle_timeout=0,
+        )
+        datapath.send_msg(mod)
+
+        self.logger.warning(
+            "POLICY ADD: source=%s -> dpid=%s port=%d "
+            "persistent targeted DROP priority=%d",
+            ipv4_src,
+            datapath.id,
+            ingress_port,
+            priority,
+        )
+
+    def remove_admin_drop(
+        self,
+        datapath,
+        ingress_port,
+        ipv4_src,
+        priority,
+    ):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        match = parser.OFPMatch(
+            in_port=ingress_port,
+            eth_type=0x0800,
+            ipv4_src=ipv4_src,
+        )
+
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE_STRICT,
+            table_id=0,
+            priority=priority,
+            match=match,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+        )
+        datapath.send_msg(mod)
+
+        self.logger.warning(
+            "POLICY REMOVE: source=%s -> dpid=%s port=%d "
+            "persistent DROP removed",
+            ipv4_src,
+            datapath.id,
+            ingress_port,
+        )
+
+
+class ExternalBlocklist:
+    """Legge una blocklist IPv4 condivisa da un file JSON."""
+
+    def __init__(self, path, logger):
+        self.path = Path(path)
+        self.logger = logger
+
+    def load(self):
+        """
+        Ritorna:
+        - set di IPv4 quando il file e' valido;
+        - None se file/formato sono temporaneamente non validi.
+
+        None fa conservare le policy gia' installate: un salvataggio
+        parziale del file non deve causare uno sblocco accidentale.
+        """
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            self.logger.error(
+                "External blocklist missing: %s",
+                self.path,
+            )
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.error(
+                "Cannot read external blocklist %s: %s",
+                self.path,
+                exc,
+            )
+            return None
+
+        raw_entries = data.get("blocked_ipv4")
+        if not isinstance(raw_entries, list):
+            self.logger.error(
+                "Invalid blocklist: 'blocked_ipv4' must be a list"
+            )
+            return None
+
+        result = set()
+
+        for value in raw_entries:
+            if not isinstance(value, str):
+                self.logger.warning(
+                    "Ignoring non-string blocklist entry: %r",
+                    value,
+                )
+                continue
+
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                self.logger.warning(
+                    "Ignoring invalid IP in blocklist: %s",
+                    value,
+                )
+                continue
+
+            if address.version != 4:
+                self.logger.warning(
+                    "Ignoring non-IPv4 blocklist entry: %s",
+                    value,
+                )
+                continue
+
+            result.add(str(address))
+
+        return result
+
+
+class PolicyEnforcer:
+    """
+    Converte la blocklist esterna in regole OpenFlow persistenti.
+
+    installed:
+        ipv4_src -> (dpid, port)
+
+    La regola viene installata sulla migliore porta single-source
+    conosciuta dal SourceTracker, evitando il blocco indiscriminato
+    di un uplink condiviso.
+    """
+
+    def __init__(self, mitigator, priority, logger):
+        self.mitigator = mitigator
+        self.priority = priority
+        self.logger = logger
+        self.installed = {}
+        self._waiting_logged = set()
+
+    def forget_datapath(self, dpid):
+        stale = [
+            ipv4_src
+            for ipv4_src, key in self.installed.items()
+            if key[0] == dpid
+        ]
+
+        for ipv4_src in stale:
+            del self.installed[ipv4_src]
+
+    def reconcile(
+        self,
+        desired_ipv4,
+        datapaths,
+        source_tracker,
+    ):
+        # 1) Rimuove policy che l'admin ha cancellato dal file.
+        for ipv4_src in sorted(
+            set(self.installed) - set(desired_ipv4)
+        ):
+            key = self.installed.get(ipv4_src)
+            if key is None:
+                continue
+
+            dpid, port = key
+            datapath = datapaths.get(dpid)
+
+            if datapath is not None:
+                self.mitigator.remove_admin_drop(
+                    datapath=datapath,
+                    ingress_port=port,
+                    ipv4_src=ipv4_src,
+                    priority=self.priority,
+                )
+
+            del self.installed[ipv4_src]
+            self._waiting_logged.discard(ipv4_src)
+
+        # 2) Installa/riconcilia le policy desiderate.
+        for ipv4_src in sorted(desired_ipv4):
+            location = source_tracker.find_single_source_location(
+                ipv4_src
+            )
+
+            if location is None:
+                if ipv4_src not in self._waiting_logged:
+                    self.logger.info(
+                        "POLICY WAIT: source=%s not learned on a "
+                        "single-source port yet",
+                        ipv4_src,
+                    )
+                    self._waiting_logged.add(ipv4_src)
+                continue
+
+            self._waiting_logged.discard(ipv4_src)
+
+            old_location = self.installed.get(ipv4_src)
+
+            if old_location == location:
+                continue
+
+            # Host spostato: rimuove prima l'eventuale vecchia regola.
+            if old_location is not None:
+                old_dpid, old_port = old_location
+                old_datapath = datapaths.get(old_dpid)
+
+                if old_datapath is not None:
+                    self.mitigator.remove_admin_drop(
+                        datapath=old_datapath,
+                        ingress_port=old_port,
+                        ipv4_src=ipv4_src,
+                        priority=self.priority,
+                    )
+
+                del self.installed[ipv4_src]
+
+            dpid, port = location
+            datapath = datapaths.get(dpid)
+
+            if datapath is None:
+                continue
+
+            self.mitigator.install_admin_drop(
+                datapath=datapath,
+                ingress_port=port,
+                ipv4_src=ipv4_src,
+                priority=self.priority,
+            )
+
+            self.installed[ipv4_src] = location
+
 
 class StatsLogger:
     HEADER = [
@@ -342,6 +605,8 @@ class StatsLogger:
 
 class DosController(simple_switch_13.SimpleSwitch13):
     POLL_INTERVAL = 2
+    POLICY_POLL_INTERVAL = 1
+    ADMIN_PRIORITY = 110
 
     MIN_THRESHOLD_MBPS = 1.5
     THRESHOLD_MULTIPLIER = 1.5
@@ -374,11 +639,28 @@ class DosController(simple_switch_13.SimpleSwitch13):
         self.source_selector = SourceSelector()
         self.mitigator = Mitigator(self.logger)
 
+        project_root = Path(__file__).resolve().parents[1]
+        blocklist_path = os.environ.get(
+            "BLOCKLIST_FILE",
+            str(project_root / "policy" / "blocklist.json"),
+        )
+
+        self.external_blocklist = ExternalBlocklist(
+            blocklist_path,
+            self.logger,
+        )
+        self.policy_enforcer = PolicyEnforcer(
+            mitigator=self.mitigator,
+            priority=self.ADMIN_PRIORITY,
+            logger=self.logger,
+        )
+
         run_id = os.environ.get("RUN_ID", "manual")
         self.stats_logger = StatsLogger(run_id)
         self.log_path = self.stats_logger.log_path
 
         self.monitor_thread = hub.spawn(self._monitor)
+        self.policy_thread = hub.spawn(self._policy_loop)
 
         self.logger.info(
             "DoS controller started: adaptive threshold, "
@@ -390,6 +672,14 @@ class DosController(simple_switch_13.SimpleSwitch13):
             self.TRAINING_SAMPLES,
             self.REQUIRED_HITS,
             self.BLOCK_SECONDS,
+        )
+
+        self.logger.info(
+            "External blocklist enabled: file=%s, poll=%ds, "
+            "admin_priority=%d",
+            self.external_blocklist.path,
+            self.POLICY_POLL_INTERVAL,
+            self.ADMIN_PRIORITY,
         )
 
     @set_ev_cls(
@@ -407,6 +697,9 @@ class DosController(simple_switch_13.SimpleSwitch13):
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapaths:
                 del self.datapaths[datapath.id]
+                self.policy_enforcer.forget_datapath(
+                    datapath.id
+                )
                 self.logger.info("Unregistered datapath %016x", datapath.id)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -444,6 +737,19 @@ class DosController(simple_switch_13.SimpleSwitch13):
                 self.monitor.request_port_stats(datapath)
 
             hub.sleep(self.POLL_INTERVAL)
+
+    def _policy_loop(self):
+        while True:
+            desired_ipv4 = self.external_blocklist.load()
+
+            if desired_ipv4 is not None:
+                self.policy_enforcer.reconcile(
+                    desired_ipv4=desired_ipv4,
+                    datapaths=self.datapaths,
+                    source_tracker=self.source_tracker,
+                )
+
+            hub.sleep(self.POLICY_POLL_INTERVAL)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
