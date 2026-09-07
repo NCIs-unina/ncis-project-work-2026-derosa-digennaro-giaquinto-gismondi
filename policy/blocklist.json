@@ -1,3 +1,1 @@
-{
-  "blocked_ipv4": []
-}
+{"blocked_ipv4": [], "allowlisted_ipv4": []}

@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-Controller DoS - Fase M5: sblocco automatico basato sul traffico.
+Controller DoS - Fase M6: allowlist amministrativa esterna.
 
-Evoluzione di M4:
+Evoluzione di M5:
 - detector adattivo EWMA invariato;
-- DROP mirato per ipv4_src invariato;
-- blocklist amministrativa esterna invariata;
-- il DROP automatico NON usa piu' un hard_timeout fisso;
-- il controller osserva la porta host-facing della sorgente bloccata;
-- dopo QUIET_SAMPLES campioni consecutivi sotto UNBLOCK_RATE_MBPS,
-  rimuove esplicitamente il DROP con OFPFC_DELETE_STRICT.
+- DROP automatico mirato + intelligent unblock invariati;
+- blocklist amministrativa M4 invariata;
+- aggiunge una allowlist IPv4 esterna nello stesso file JSON.
 
-Le policy amministrative restano separate:
-- priority=110, persistenti finche' presenti nel JSON.
-Le mitigazioni automatiche M5:
-- priority=100, hard_timeout=0;
-- rimosse solo dalla logica di intelligent unblock.
+Semantica:
+- blocked_ipv4: policy amministrativa esplicita di DROP (priority=110);
+- allowlisted_ipv4: sorgenti che il detector AUTOMATICO non puo' mitigare;
+- se un IP compare in entrambe, blocked_ipv4 ha precedenza.
+
+L'allowlist non disabilita il monitoraggio: il controller continua a
+rilevare l'anomalia e registra ALLOWLIST_SUPPRESSED, ma non installa
+un DROP automatico per una sorgente esplicitamente trusted.
+
+Formato:
+{
+  "blocked_ipv4": [],
+  "allowlisted_ipv4": []
+}
 """
 
 import csv
@@ -271,8 +277,20 @@ class SourceSelector:
         monitor,
         source_tracker,
         minimum_rate_mbps,
+        excluded_ipv4=None,
     ):
+        """
+        Ritorna (offender, suppressed).
+
+        offender:
+            sorgente non-allowlisted con rate piu' alto.
+
+        suppressed:
+            lista di sorgenti ad alto rate escluse perche' allowlisted.
+        """
+        excluded_ipv4 = set(excluded_ipv4 or ())
         candidates = []
+        suppressed = []
 
         for key, rate in monitor.latest_rates.items():
             if key == detected_key:
@@ -285,17 +303,28 @@ class SourceSelector:
             if source is None:
                 continue
 
-            candidates.append({
+            candidate = {
                 "source_key": key,
                 "rate_mbps": rate,
                 "ip": source["ip"],
                 "mac": source["mac"],
-            })
+            }
 
-        if not candidates:
-            return None
+            if source["ip"] in excluded_ipv4:
+                suppressed.append(candidate)
+                continue
 
-        return max(candidates, key=lambda candidate: candidate["rate_mbps"])
+            candidates.append(candidate)
+
+        offender = None
+
+        if candidates:
+            offender = max(
+                candidates,
+                key=lambda candidate: candidate["rate_mbps"],
+            )
+
+        return offender, suppressed
 
 
 class Mitigator:
@@ -447,52 +476,34 @@ class Mitigator:
         )
 
 
-class ExternalBlocklist:
-    """Legge una blocklist IPv4 condivisa da un file JSON."""
+class ExternalPolicyStore:
+    """
+    Legge blocklist e allowlist IPv4 dallo stesso file JSON.
+
+    Ritorna l'ultima policy solo quando il file e' interamente valido.
+    Un salvataggio parziale/non valido non deve alterare le policy
+    correntemente applicate.
+    """
 
     def __init__(self, path, logger):
         self.path = Path(path)
         self.logger = logger
 
-    def load(self):
-        """
-        Ritorna:
-        - set di IPv4 quando il file e' valido;
-        - None se file/formato sono temporaneamente non validi.
+    def _parse_ipv4_list(self, data, field):
+        raw_entries = data.get(field)
 
-        None fa conservare le policy gia' installate: un salvataggio
-        parziale del file non deve causare uno sblocco accidentale.
-        """
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            self.logger.error(
-                "External blocklist missing: %s",
-                self.path,
-            )
-            return None
-        except (OSError, json.JSONDecodeError) as exc:
-            self.logger.error(
-                "Cannot read external blocklist %s: %s",
-                self.path,
-                exc,
-            )
-            return None
-
-        raw_entries = data.get("blocked_ipv4")
         if not isinstance(raw_entries, list):
-            self.logger.error(
-                "Invalid blocklist: 'blocked_ipv4' must be a list"
+            raise ValueError(
+                "'%s' must be a list" % field
             )
-            return None
 
         result = set()
 
         for value in raw_entries:
             if not isinstance(value, str):
                 self.logger.warning(
-                    "Ignoring non-string blocklist entry: %r",
+                    "Ignoring non-string entry in %s: %r",
+                    field,
                     value,
                 )
                 continue
@@ -501,14 +512,16 @@ class ExternalBlocklist:
                 address = ipaddress.ip_address(value)
             except ValueError:
                 self.logger.warning(
-                    "Ignoring invalid IP in blocklist: %s",
+                    "Ignoring invalid IP in %s: %s",
+                    field,
                     value,
                 )
                 continue
 
             if address.version != 4:
                 self.logger.warning(
-                    "Ignoring non-IPv4 blocklist entry: %s",
+                    "Ignoring non-IPv4 entry in %s: %s",
+                    field,
                     value,
                 )
                 continue
@@ -516,6 +529,57 @@ class ExternalBlocklist:
             result.add(str(address))
 
         return result
+
+    def load(self):
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            self.logger.error(
+                "External policy file missing: %s",
+                self.path,
+            )
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.error(
+                "Cannot read external policy file %s: %s",
+                self.path,
+                exc,
+            )
+            return None
+
+        try:
+            blocked = self._parse_ipv4_list(
+                data,
+                "blocked_ipv4",
+            )
+            allowlisted = self._parse_ipv4_list(
+                data,
+                "allowlisted_ipv4",
+            )
+        except ValueError as exc:
+            self.logger.error(
+                "Invalid external policy: %s",
+                exc,
+            )
+            return None
+
+        conflicts = blocked & allowlisted
+
+        if conflicts:
+            self.logger.warning(
+                "POLICY CONFLICT: blocked_ipv4 wins over "
+                "allowlisted_ipv4 for: %s",
+                ",".join(sorted(conflicts)),
+            )
+
+        # Un blocco esplicito dell'admin ha precedenza.
+        effective_allowlisted = allowlisted - blocked
+
+        return {
+            "blocked_ipv4": blocked,
+            "allowlisted_ipv4": effective_allowlisted,
+        }
 
 
 class PolicyEnforcer:
@@ -737,7 +801,7 @@ class DosController(simple_switch_13.SimpleSwitch13):
             str(project_root / "policy" / "blocklist.json"),
         )
 
-        self.external_blocklist = ExternalBlocklist(
+        self.external_policy = ExternalPolicyStore(
             blocklist_path,
             self.logger,
         )
@@ -746,6 +810,9 @@ class DosController(simple_switch_13.SimpleSwitch13):
             priority=self.ADMIN_PRIORITY,
             logger=self.logger,
         )
+
+        # Snapshot dell'allowlist valida piu' recente.
+        self.allowlisted_ipv4 = set()
 
         run_id = os.environ.get("RUN_ID", "manual")
         self.stats_logger = StatsLogger(run_id)
@@ -773,9 +840,9 @@ class DosController(simple_switch_13.SimpleSwitch13):
         )
 
         self.logger.info(
-            "External blocklist enabled: file=%s, poll=%ds, "
+            "External policy enabled: file=%s, poll=%ds, "
             "admin_priority=%d",
-            self.external_blocklist.path,
+            self.external_policy.path,
             self.POLICY_POLL_INTERVAL,
             self.ADMIN_PRIORITY,
         )
@@ -838,11 +905,30 @@ class DosController(simple_switch_13.SimpleSwitch13):
 
     def _policy_loop(self):
         while True:
-            desired_ipv4 = self.external_blocklist.load()
+            policy = self.external_policy.load()
 
-            if desired_ipv4 is not None:
+            if policy is not None:
+                desired_blocked = policy["blocked_ipv4"]
+                desired_allowlisted = policy["allowlisted_ipv4"]
+
+                if desired_allowlisted != self.allowlisted_ipv4:
+                    self.allowlisted_ipv4 = set(
+                        desired_allowlisted
+                    )
+
+                    self.logger.info(
+                        "ALLOWLIST UPDATE: %s",
+                        (
+                            ",".join(
+                                sorted(self.allowlisted_ipv4)
+                            )
+                            if self.allowlisted_ipv4
+                            else "<empty>"
+                        ),
+                    )
+
                 self.policy_enforcer.reconcile(
-                    desired_ipv4=desired_ipv4,
+                    desired_ipv4=desired_blocked,
                     datapaths=self.datapaths,
                     source_tracker=self.source_tracker,
                 )
@@ -991,25 +1077,44 @@ class DosController(simple_switch_13.SimpleSwitch13):
             status = self.detector.observe(key, rx_mbps)
 
             if status["attack"]:
-                offender = self.source_selector.select(
+                offender, suppressed = self.source_selector.select(
                     detected_key=key,
                     monitor=self.monitor,
                     source_tracker=self.source_tracker,
                     minimum_rate_mbps=self.TRAINING_MIN_MBPS,
+                    excluded_ipv4=self.allowlisted_ipv4,
                 )
 
                 if offender is None:
                     self.detector.reset_hits(key)
                     status["hits"] = 0
-                    action = "TARGET_NOT_FOUND"
 
-                    self.logger.warning(
-                        "Adaptive detector triggered on dpid=%s port=%d "
-                        "but no high-rate unique source was identified; "
-                        "no broad DROP installed",
-                        datapath.id,
-                        port,
-                    )
+                    if suppressed:
+                        action = "ALLOWLIST_SUPPRESSED"
+
+                        self.logger.warning(
+                            "Automatic mitigation suppressed by allowlist "
+                            "on dpid=%s port=%d trusted=%s",
+                            datapath.id,
+                            port,
+                            ",".join(
+                                sorted(
+                                    candidate["ip"]
+                                    for candidate in suppressed
+                                )
+                            ),
+                        )
+
+                    else:
+                        action = "TARGET_NOT_FOUND"
+
+                        self.logger.warning(
+                            "Adaptive detector triggered on dpid=%s port=%d "
+                            "but no high-rate unique source was identified; "
+                            "no broad DROP installed",
+                            datapath.id,
+                            port,
+                        )
 
                 else:
                     self.mitigator.install_targeted_drop(
