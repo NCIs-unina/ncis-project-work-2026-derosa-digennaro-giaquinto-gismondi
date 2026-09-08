@@ -1,0 +1,18 @@
+scenario,component,subject,metric,value,unit,evidence
+FINAL_A,Adaptive detector,s1 uplink,baseline_after_training,2.044,Mbps,Stable during idle in the final run
+FINAL_A,Adaptive detector,s1 uplink,threshold_after_training,3.066,Mbps,Adaptive threshold after benign training
+FINAL_A,Automatic mitigation,h1,detection_delay,5.608,s,Attack start to DROP_INSTALLED
+FINAL_A,Automatic mitigation,h1,drop_lifetime,58.919,s,Automatic targeted DROP lifetime
+FINAL_A,Intelligent unblock,h1,unblock_after_traffic_end,4.526,s,Traffic end to DROP_REMOVED
+FINAL_A,Selective mitigation,h1,packet_loss_during_mitigation,100,%,Attacker blocked
+FINAL_A,Selective mitigation,h5,packet_loss_during_mitigation,0,%,Legitimate host preserved
+FINAL_A,Selective mitigation,h2,packet_loss_during_mitigation,0,%,Legitimate host preserved
+FINAL_A,Post-unblock,h1,packet_loss_after_unblock,0,%,Connectivity restored
+FINAL_A,Post-unblock,h5,packet_loss_after_unblock,0,%,Connectivity preserved
+FINAL_A,Post-unblock,h2,packet_loss_after_unblock,0,%,Connectivity preserved
+FINAL_B,External allowlist,h5,packet_loss_high_rate_allowlisted,0,%,ALLOWLIST_SUPPRESSED; no automatic priority-100 DROP
+FINAL_B,Automatic mitigation,h5,packet_loss_high_rate_unallowlisted,100,%,Targeted priority-100 DROP installed
+FINAL_B,External blocklist,h5,packet_loss_admin_blocked,100,%,Persistent priority-110 DROP on s2 port 3
+FINAL_B,External blocklist,h1,packet_loss_while_h5_admin_blocked,0,%,Selective admin policy
+FINAL_B,External blocklist,h2,packet_loss_while_h5_admin_blocked,0,%,Selective admin policy
+FINAL_B,External blocklist,h5,packet_loss_after_admin_unblock,0,%,Connectivity restored after policy removal

@@ -1,0 +1,7 @@
+phase,issue_or_feature,type,mechanism,final_evidence
+M1,Lack of Modular Detection and Mitigation Design,Flaw,TrafficMonitor; AdaptiveDetector; SourceTracker; SourceSelector; Blocklist; Mitigator; StatsLogger; PolicyEnforcer,Controller responsibilities separated into modules
+M2,Over-blocking,Mandatory flaw,Per-source IPv4 targeted DROP instead of whole-port DROP,h1 blocked while legitimate h5/h2 remain reachable
+M3,Static Threshold,Chosen flaw,Training + EWMA adaptive baseline and dynamic threshold,FINAL-A baseline 2.044 Mbps; threshold 3.066 Mbps
+M4,Controller-Centric Blocking Decisions,Mandatory flaw,External JSON blocklist reconciled into persistent priority-110 OpenFlow rules,FINAL-B admin block/unblock of h5
+M5,Inflexible Blocking/Unblocking Policy,Chosen flaw,Traffic-aware persistent automatic DROP + explicit DELETE_STRICT after quiet samples,FINAL-A DROP lifetime 58.919 s; unblock 4.526 s after traffic end
+M6,External Allowlist,Extra feature,Runtime allowlist suppresses automatic mitigation for trusted IPv4 sources,FINAL-B ALLOWLIST_SUPPRESSED; h5 remains reachable
