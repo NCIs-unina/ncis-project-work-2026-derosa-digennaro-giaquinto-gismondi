@@ -6,7 +6,8 @@ Evoluzione di M5:
 - detector adattivo EWMA invariato;
 - DROP automatico mirato + intelligent unblock invariati;
 - blocklist amministrativa M4 invariata;
-- aggiunge una allowlist IPv4 esterna nello stesso file JSON.
+- aggiunge una allowlist IPv4 esterna nello stesso file JSON;
+- stabilizza l'EWMA ignorando piccoli residui post-flusso.
 
 Semantica:
 - blocked_ipv4: policy amministrativa esplicita di DROP (priority=110);
@@ -81,6 +82,7 @@ class AdaptiveDetector:
         ewma_alpha,
         training_samples,
         training_min_mbps,
+        baseline_update_min_ratio,
     ):
         self.required_hits = required_hits
         self.min_threshold_mbps = min_threshold_mbps
@@ -88,6 +90,7 @@ class AdaptiveDetector:
         self.ewma_alpha = ewma_alpha
         self.training_samples = training_samples
         self.training_min_mbps = training_min_mbps
+        self.baseline_update_min_ratio = baseline_update_min_ratio
 
         self._training_values = {}
         self._baseline = {}
@@ -147,10 +150,17 @@ class AdaptiveDetector:
         else:
             self._hits[key] = 0
 
-            # I campioni idle/quasi-zero non cancellano la baseline
-            # benigna appresa durante il training.
-            if rx_mbps >= self.training_min_mbps:
-                old_baseline = self._baseline[key]
+            # Stabilizzazione finale:
+            # dopo il training la baseline rappresenta traffico benigno
+            # ATTIVO. Residui molto piccoli alla fine di un flusso non
+            # devono trascinarla verso zero.
+            old_baseline = self._baseline[key]
+            active_floor = max(
+                self.training_min_mbps,
+                self.baseline_update_min_ratio * old_baseline,
+            )
+
+            if rx_mbps >= active_floor:
                 self._baseline[key] = (
                     self.ewma_alpha * rx_mbps
                     + (1.0 - self.ewma_alpha) * old_baseline
@@ -766,6 +776,10 @@ class DosController(simple_switch_13.SimpleSwitch13):
     TRAINING_SAMPLES = 5
     TRAINING_MIN_MBPS = 0.1
 
+    # Dopo il training, aggiorna la EWMA solo con traffico ancora
+    # significativamente attivo (>= 25% della baseline corrente).
+    BASELINE_UPDATE_MIN_RATIO = 0.25
+
     REQUIRED_HITS = 3
 
     # M5 intelligent unblock: 3 campioni consecutivi <= 0.1 Mbit/s.
@@ -788,6 +802,7 @@ class DosController(simple_switch_13.SimpleSwitch13):
             ewma_alpha=self.EWMA_ALPHA,
             training_samples=self.TRAINING_SAMPLES,
             training_min_mbps=self.TRAINING_MIN_MBPS,
+            baseline_update_min_ratio=self.BASELINE_UPDATE_MIN_RATIO,
         )
 
         self.blocklist = Blocklist()
@@ -824,11 +839,13 @@ class DosController(simple_switch_13.SimpleSwitch13):
         self.logger.info(
             "DoS controller started: adaptive threshold, "
             "min=%.1f Mbps, multiplier=%.2f, alpha=%.2f, "
-            "training=%d active samples, required_hits=%d",
+            "training=%d active samples, baseline_floor_ratio=%.2f, "
+            "required_hits=%d",
             self.MIN_THRESHOLD_MBPS,
             self.THRESHOLD_MULTIPLIER,
             self.EWMA_ALPHA,
             self.TRAINING_SAMPLES,
+            self.BASELINE_UPDATE_MIN_RATIO,
             self.REQUIRED_HITS,
         )
 
