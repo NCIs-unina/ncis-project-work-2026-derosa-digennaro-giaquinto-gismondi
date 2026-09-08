@@ -1,4 +1,4 @@
-# Reactive DoS Detection and Mitigation in an SDN Network using Ryu and OpenFlow
+# Adaptive and Policy-Aware DoS Detection and Mitigation in an SDN Network
 
 ## Autori
 
@@ -9,70 +9,469 @@
 
 Repository GitHub:
 
-https://github.com/NCIs-unina/ncis-project-work-2026-derosa-digennaro-giaquinto-gismondi
+`https://github.com/NCIs-unina/ncis-project-work-2026-derosa-digennaro-giaquinto-gismondi`
 
 ---
 
 ## 1. Obiettivo
 
-Il progetto realizza un semplice meccanismo di **rilevazione e mitigazione reattiva di un attacco DoS volumetrico** in una rete Software Defined Networking.
+Il progetto realizza un sistema di **rilevazione e mitigazione reattiva di attacchi DoS volumetrici** in una rete Software Defined Networking.
 
-La rete viene emulata con **Mininet** e **Open vSwitch**, mentre il piano di controllo è implementato con **Ryu** e **OpenFlow 1.3**.
+La rete è emulata con **Mininet** e **Open vSwitch**; il piano di controllo utilizza **Ryu** e **OpenFlow 1.3**.
 
-La logica del controller segue la pipeline:
+Il lavoro parte da un prototipo baseline semplice, basato su soglia statica e DROP dell'intera porta, e lo evolve correggendo cinque criticità progettuali e introducendo una funzionalità aggiuntiva:
 
-```text
-monitor -> detect -> block
-```
+| Fase | Problema / funzionalità | Soluzione implementata |
+|---|---|---|
+| **M1** | Lack of Modular Detection and Mitigation Design | Separazione in moduli di monitoraggio, detection, tracking, mitigazione, logging e policy |
+| **M2** | Over-blocking | DROP mirato per `ipv4_src`, senza bloccare tutte le sorgenti presenti sull'uplink |
+| **M3** | Static Threshold | Baseline adattiva con training + EWMA e soglia dinamica |
+| **M4** | Controller-Centric Blocking Decisions | Blocklist amministrativa esterna caricata da file JSON |
+| **M5** | Inflexible Blocking/Unblocking | Sblocco automatico traffic-aware, senza `hard_timeout` fisso |
+| **M6** | Extra feature: External Allowlist | Allowlist amministrativa che può sopprimere la mitigazione automatica per sorgenti trusted |
 
-Il controller:
-
-1. richiede periodicamente le statistiche delle porte dello switch;
-2. calcola il rate di ingresso sulla porta monitorata;
-3. rileva un traffico anomalo quando il rate supera una soglia statica per più campioni consecutivi;
-4. installa una regola OpenFlow di DROP sulla porta dell'attaccante;
-5. lascia che la regola venga rimossa automaticamente tramite `hard_timeout`.
-
-Il progetto è volutamente un **proof of concept** semplice: non utilizza classificatori, machine learning, entropy, flow-level inspection o tecniche di mitigazione avanzate.
+La versione finale mantiene inoltre una protezione contro il decadimento artificiale della baseline EWMA durante i periodi idle o nei piccoli residui di traffico post-flusso.
 
 ---
 
-## 2. Architettura
+## 2. Topologia finale
 
-Topologia:
-
-```text
-h1 attacker ─┐
-h2 legit ────┼── s1 ── 5 Mbit/s ── h4 victim
-h3 legit ────┘
-                 ↑
-                Ryu
-```
-
-Indirizzamento e mapping delle porte:
-
-| Host | Ruolo | IP | Porta su `s1` |
-|---|---|---|---:|
-| `h1` | Attacker | `10.0.0.1` | 1 |
-| `h2` | Legitimate client | `10.0.0.2` | 2 |
-| `h3` | Legitimate client | `10.0.0.3` | 3 |
-| `h4` | Victim/server | `10.0.0.4` | 4 |
-
-I link di accesso di `h1`, `h2` e `h3` sono configurati a 100 Mbit/s.
-
-Il link:
+La topologia utilizzata per la validazione finale è definita in:
 
 ```text
-s1-eth4 <-> h4-eth0
+topology/overblocking_topo.py
 ```
 
-è limitato a **5 Mbit/s** e rappresenta il bottleneck condiviso.
+Schema:
+
+```text
+                    +------ h2 10.0.0.2
+                    |
+h1 10.0.0.1 --+     |
+              +-- s2 -- shared uplink -- s1 -- h4 10.0.0.4
+h5 10.0.0.5 --+                    |      victim
+                                   |
+                                   +------ h3 10.0.0.3
+```
+
+Più precisamente:
+
+```text
+h1 attacker ── s2-eth2
+                  |
+h5 legitimate ─ s2-eth3
+                  |
+               s2-eth4
+                  |
+               s1-eth1   <- uplink condiviso monitorato
+              /   |   \
+             /    |    \
+          h2     h3    h4 victim
+                      5 Mbit/s
+```
+
+Mapping principale:
+
+| Nodo | Ruolo | IP | Collegamento |
+|---|---|---|---|
+| `h1` | attacker | `10.0.0.1` | `s2` port 2 |
+| `h5` | legitimate shared host | `10.0.0.5` | `s2` port 3 |
+| `h2` | legitimate host | `10.0.0.2` | `s1` port 2 |
+| `h3` | legitimate host | `10.0.0.3` | `s1` port 3 |
+| `h4` | victim/server | `10.0.0.4` | `s1` port 4 |
+| `s2` → `s1` | shared uplink | — | `s2` port 4 → `s1` port 1 |
+
+Caratteristiche:
+
+- link host/access: **100 Mbit/s**;
+- uplink `s2 ↔ s1`: **100 Mbit/s**;
+- link `s1 ↔ h4`: **5 Mbit/s**, usato come bottleneck;
+- `s1` DPID = `1`;
+- `s2` DPID = `2`;
+- OpenFlow 1.3;
+- controller remoto `127.0.0.1:6653`.
+
+La presenza di `h1` e `h5` dietro lo stesso uplink consente di verificare esplicitamente il problema dell'**over-blocking**: un DROP generico su `s1-eth1` colpirebbe entrambe le sorgenti.
 
 ---
 
-## 3. Requisiti
+## 3. Architettura del controller
 
-Ambiente usato durante lo sviluppo:
+Il controller finale è:
+
+```text
+controller/dos_controller.py
+```
+
+La logica non è più concentrata in un singolo blocco, ma è suddivisa in componenti con responsabilità separate:
+
+```text
+TrafficMonitor
+      |
+      v
+AdaptiveDetector
+      |
+      v
+SourceTracker ---> SourceSelector
+      |                 |
+      +--------+--------+
+               |
+               v
+           Mitigator
+               |
+               v
+           OpenFlow
+
+ExternalPolicyStore ---> PolicyEnforcer ---> Mitigator
+
+Blocklist automatic state ---> Intelligent Unblock
+StatsLogger -----------------> CSV
+```
+
+Componenti principali:
+
+- **TrafficMonitor**: richiede e processa le PortStats OpenFlow;
+- **AdaptiveDetector**: training, baseline EWMA, threshold dinamico e conteggio degli hit;
+- **SourceTracker**: apprende IP/MAC osservati sulle porte;
+- **SourceSelector**: individua la sorgente ad alto rate candidata alla mitigazione;
+- **Blocklist**: mantiene lo stato delle mitigazioni automatiche attive;
+- **Mitigator**: installa e rimuove le regole OpenFlow;
+- **StatsLogger**: salva rate, baseline, threshold, stato e azioni in CSV;
+- **ExternalPolicyStore**: legge `blocked_ipv4` e `allowlisted_ipv4` dal JSON;
+- **PolicyEnforcer**: riconcilia le policy amministrative con le flow OpenFlow;
+- **DosController**: orchestra tutti i moduli.
+
+---
+
+## 4. Detection adattiva
+
+Parametri principali della versione finale:
+
+```python
+POLL_INTERVAL = 2
+POLICY_POLL_INTERVAL = 1
+
+MIN_THRESHOLD_MBPS = 1.5
+THRESHOLD_MULTIPLIER = 1.5
+EWMA_ALPHA = 0.2
+
+TRAINING_SAMPLES = 5
+TRAINING_MIN_MBPS = 0.1
+BASELINE_UPDATE_MIN_RATIO = 0.25
+
+REQUIRED_HITS = 3
+MONITORED_PORTS = {1}
+```
+
+### Calcolo del rate
+
+Il controller legge i byte cumulativi ricevuti sulla porta:
+
+```text
+rx_bytes(t)
+```
+
+e calcola:
+
+```text
+rate [Mbit/s] =
+    8 * (rx_bytes(t) - rx_bytes(t-1))
+    ---------------------------------
+       (t - t-1) * 1,000,000
+```
+
+### Training
+
+Per ogni porta monitorata vengono raccolti **5 campioni attivi** con rate almeno:
+
+```text
+0.1 Mbit/s
+```
+
+Durante il training, la baseline è la media dei campioni osservati.
+
+### Threshold adattivo
+
+Terminato il training:
+
+```text
+threshold = max(
+    MIN_THRESHOLD_MBPS,
+    THRESHOLD_MULTIPLIER * baseline
+)
+```
+
+con:
+
+```text
+MIN_THRESHOLD_MBPS = 1.5
+THRESHOLD_MULTIPLIER = 1.5
+```
+
+La baseline viene aggiornata tramite EWMA:
+
+```text
+baseline_new =
+    alpha * rate +
+    (1 - alpha) * baseline_old
+```
+
+con:
+
+```text
+alpha = 0.2
+```
+
+### Protezione della baseline
+
+La baseline non viene aggiornata:
+
+1. mentre `rate > threshold`, per evitare threshold poisoning durante l'attacco;
+2. quando il traffico è troppo basso per rappresentare traffico benigno attivo.
+
+Dopo il training, il floor dinamico è:
+
+```text
+active_floor = max(
+    TRAINING_MIN_MBPS,
+    BASELINE_UPDATE_MIN_RATIO * baseline
+)
+```
+
+dove:
+
+```text
+BASELINE_UPDATE_MIN_RATIO = 0.25
+```
+
+In questo modo piccoli residui post-flusso e campioni idle non trascinano artificialmente la baseline verso zero.
+
+### Detection
+
+Un'anomalia diventa attacco dopo:
+
+```text
+3 campioni consecutivi
+```
+
+con:
+
+```text
+rate > threshold
+```
+
+---
+
+## 5. Mitigazione automatica mirata
+
+Il controller non installa più:
+
+```text
+match(in_port=1) -> DROP
+```
+
+perché tale regola provocherebbe over-blocking su un uplink condiviso.
+
+Il `SourceTracker` apprende invece la posizione delle sorgenti e il `SourceSelector` seleziona la sorgente ad alto rate.
+
+Per esempio, se `h1 = 10.0.0.1` è identificato come offender, su `s1` viene installata una regola:
+
+```text
+priority=100
+in_port=1
+eth_type=IPv4
+ipv4_src=10.0.0.1
+actions=drop
+```
+
+La flow è quindi mirata alla singola sorgente IPv4.
+
+La regola automatica usa:
+
+```text
+hard_timeout = 0
+idle_timeout = 0
+```
+
+e non viene rimossa da un timer fisso.
+
+---
+
+## 6. Intelligent Unblock
+
+La versione baseline rimuoveva il DROP dopo un `hard_timeout` fisso. La versione finale usa invece il traffico reale della sorgente.
+
+Parametri:
+
+```python
+UNBLOCK_RATE_MBPS = 0.1
+UNBLOCK_QUIET_SAMPLES = 3
+```
+
+Quando una sorgente è bloccata, il controller continua a monitorare la sua porta host-facing, ad esempio:
+
+```text
+h1 -> s2 port 2
+```
+
+Se il rate della sorgente è:
+
+```text
+<= 0.1 Mbit/s
+```
+
+per **3 campioni consecutivi**, il controller rimuove esplicitamente la flow automatica tramite:
+
+```text
+OFPFC_DELETE_STRICT
+```
+
+Questo evita sia:
+
+- uno sblocco prematuro mentre l'attacco è ancora attivo;
+- un blocco inutilmente lungo dopo la fine dell'attacco.
+
+---
+
+## 7. Policy amministrative esterne
+
+Il file:
+
+```text
+policy/blocklist.json
+```
+
+ha il formato:
+
+```json
+{
+  "blocked_ipv4": [],
+  "allowlisted_ipv4": []
+}
+```
+
+Il controller lo rilegge ogni:
+
+```text
+1 s
+```
+
+### Blocklist
+
+Esempio:
+
+```json
+{
+  "blocked_ipv4": ["10.0.0.5"],
+  "allowlisted_ipv4": []
+}
+```
+
+Il controller individua una porta dove quella sorgente è l'unico host appreso e installa una policy amministrativa persistente con:
+
+```text
+priority=110
+```
+
+Esempio per `h5`:
+
+```text
+priority=110,ip,in_port=3,nw_src=10.0.0.5 actions=drop
+```
+
+sullo switch `s2`.
+
+La policy resta installata finché l'indirizzo rimane in `blocked_ipv4`.
+
+### Allowlist
+
+Esempio:
+
+```json
+{
+  "blocked_ipv4": [],
+  "allowlisted_ipv4": ["10.0.0.5"]
+}
+```
+
+Il monitoraggio e la detection continuano normalmente, ma il controller non installa un DROP automatico sulla sorgente trusted.
+
+L'evento viene registrato come:
+
+```text
+ALLOWLIST_SUPPRESSED
+```
+
+### Conflitto
+
+Se un indirizzo compare contemporaneamente in:
+
+```text
+blocked_ipv4
+```
+
+e:
+
+```text
+allowlisted_ipv4
+```
+
+ha precedenza la **blocklist amministrativa**.
+
+---
+
+## 8. Logging
+
+Con la variabile:
+
+```bash
+RUN_ID=<nome>
+```
+
+il controller crea:
+
+```text
+results/raw/<nome>_controller.csv
+```
+
+Campi principali:
+
+```text
+timestamp
+dpid
+port
+rx_mbps
+hits
+blocked
+action
+baseline_mbps
+threshold_mbps
+training_count
+trained
+```
+
+Azioni significative:
+
+```text
+DROP_INSTALLED
+DROP_REMOVED
+ALLOWLIST_SUPPRESSED
+TARGET_NOT_FOUND
+```
+
+Le policy amministrative vengono inoltre riportate nel log Ryu tramite eventi:
+
+```text
+POLICY ADD
+POLICY REMOVE
+ALLOWLIST UPDATE
+```
+
+---
+
+## 9. Requisiti
+
+Ambiente utilizzato:
 
 - Ubuntu 22.04 su WSL2;
 - Python 3.10;
@@ -81,59 +480,17 @@ Ambiente usato durante lo sviluppo:
 - OpenFlow 1.3;
 - Ryu 4.34;
 - iperf3;
-- pandas;
-- matplotlib.
+- matplotlib per i grafici finali.
 
-Per Mininet sono necessari anche i normali strumenti installati dal relativo script di setup.
-
-Esempio di installazione Mininet 2.3.0:
-
-```bash
-git clone https://github.com/mininet/mininet
-cd mininet
-git checkout 2.3.0
-sudo PYTHON=python3 util/install.sh -nv
-```
-
-Verifica:
-
-```bash
-sudo mn --switch ovsbr --test pingall
-```
-
-Per gli strumenti di analisi:
-
-```bash
-sudo apt update
-sudo apt install -y python3-pandas python3-matplotlib
-```
-
-Verifica:
-
-```bash
-python3 -c 'import pandas, matplotlib; print("analysis environment OK")'
-```
-
----
-
-## 4. Setup di Ryu
-
-Il controller viene eseguito in un virtual environment separato.
-
-Creazione del virtual environment:
+Il virtual environment Ryu viene mantenuto separato:
 
 ```bash
 python3 -m venv ~/ryuenv
 source ~/ryuenv/bin/activate
-```
-
-Installare le dipendenze del progetto:
-
-```bash
 pip install -r requirements-lock.txt
 ```
 
-L'ambiente utilizzato durante lo sviluppo comprende:
+L'ambiente Ryu utilizzato comprende:
 
 ```text
 Ryu 4.34
@@ -143,545 +500,337 @@ setuptools 67.6.1
 packaging 20.9
 ```
 
-> **Importante:** l'ambiente Ryu e l'ambiente usato per l'analisi dei dati sono separati. `pandas` e `matplotlib` possono essere eseguiti con il Python di sistema.
+Matplotlib non è necessario all'esecuzione del controller e può essere utilizzato con il Python di sistema.
 
-### Nota importante sul cleanup di Mininet
+---
 
-Eseguire:
+## 10. Avvio
 
-```text
+### Pulizia iniziale
+
+Eseguire il cleanup **prima** di Ryu:
+
+```bash
+cd ~/ncis-project
 sudo mn -c
 ```
 
-**prima di avviare Ryu, non dopo**, perché il cleanup di Mininet termina anche processi `ryu-manager`.
+> `sudo mn -c` può terminare processi `ryu-manager`; per questo non deve essere eseguito mentre il controller deve restare attivo.
 
-La sequenza corretta è:
-
-```text
-sudo mn -c
-    ↓
-start Ryu
-    ↓
-start Mininet
-    ↓
-esperimento
-    ↓
-exit Mininet
-    ↓
-Ctrl+C Ryu
-    ↓
-sudo mn -c
-```
-
----
-
-## 5. Topologia
-
-Il file della topologia è:
-
-```text
-topology/simple_dos_topo.py
-```
-
-Avvio:
-
-```bash
-cd ~/ncis-project
-sudo python3 topology/simple_dos_topo.py
-```
-
-Dentro la CLI Mininet verificare la connettività:
-
-```text
-pingall
-```
-
-Il risultato atteso è:
-
-```text
-*** Results: 0% dropped
-```
-
-Per verificare il bottleneck:
-
-```text
-sh tc class show dev s1-eth4
-```
-
-La classe deve riportare:
-
-```text
-rate 5Mbit ceil 5Mbit
-```
-
----
-
-## 6. Controller
-
-Il controller custom è:
-
-```text
-controller/dos_controller.py
-```
-
-Parametri principali:
-
-```python
-POLL_INTERVAL = 2
-THRESHOLD_MBPS = 1.5
-REQUIRED_HITS = 3
-BLOCK_SECONDS = 20
-MONITORED_PORTS = {1}
-```
-
-Il prototipo monitora quindi la porta 1, alla quale è collegato `h1`.
-
-Ogni 2 secondi il controller invia una `OFPPortStatsRequest`.
-
-Il rate viene calcolato usando la differenza tra due valori cumulativi di `rx_bytes`:
-
-```text
-rate [bit/s] =
-    8 * (rx_bytes(t) - rx_bytes(t-1))
-    ---------------------------------
-             t - (t-1)
-```
-
-Il valore viene poi convertito in Mbit/s.
-
-Quando:
-
-```text
-rate > 1.5 Mbit/s
-```
-
-per **3 campioni consecutivi**, il controller installa:
-
-```text
-match(in_port=1) -> DROP
-```
-
-con:
-
-```text
-priority = 100
-hard_timeout = 20 s
-```
-
-### Avvio del controller custom
-
-```bash
-cd ~/ncis-project
-source ~/ryuenv/bin/activate
-
-RUN_ID=E3 \
-ryu-manager \
-    --ofp-tcp-listen-port 6653 \
-    controller/dos_controller.py
-```
-
-Il controller salva automaticamente:
-
-```text
-results/raw/E3_controller.csv
-```
-
----
-
-## 7. Controller standard per E1 ed E2
-
-Gli scenari senza protezione usano il learning switch standard di Ryu:
-
-```bash
-cd ~/ncis-project
-source ~/ryuenv/bin/activate
-
-ryu-manager \
-    --ofp-tcp-listen-port 6653 \
-    ryu.app.simple_switch_13
-```
-
----
-
-## 8. Scenario E1 — Baseline
-
-E1 misura il comportamento della rete senza attacco.
-
-Traffico:
-
-```text
-h2 -> h4 = 2 Mbit/s UDP
-h3 -> h4 = 2 Mbit/s UDP
-durata = 30 s
-```
-
-Usare il controller standard.
-
-Dentro Mininet:
-
-```text
-sh pkill iperf3
-
-h4 iperf3 -s -p 5201 -D
-h4 iperf3 -s -p 5202 -D
-
-h2 sh -c 'ping -D -i 0.5 -c 60 10.0.0.4 > /tmp/E1_ping_h2.txt 2>&1 &'
-
-h2 sh -c 'iperf3 -c 10.0.0.4 -u -b 2M -t 30 -p 5201 > /tmp/E1_h2.txt 2>&1 &'
-h3 sh -c 'iperf3 -c 10.0.0.4 -u -b 2M -t 30 -p 5202 > /tmp/E1_h3.txt 2>&1 &'
-
-sh sleep 32
-
-sh cp /tmp/E1_ping_h2.txt results/raw/E1_ping_h2.txt
-sh cp /tmp/E1_h2.txt results/raw/E1_h2.txt
-sh cp /tmp/E1_h3.txt results/raw/E1_h3.txt
-```
-
----
-
-## 9. Scenario E2 — DoS senza protezione
-
-E2 utilizza lo stesso controller standard di E1.
-
-Timeline prevista:
-
-```text
-t = 0 s   partono h2 e h3
-t = 10 s  parte h1
-t = 25 s  termina h1
-t = 30 s  terminano h2 e h3
-```
-
-Traffico:
-
-```text
-h2 -> h4 = 2 Mbit/s UDP
-h3 -> h4 = 2 Mbit/s UDP
-h1 -> h4 = offered load configurato a 20 Mbit/s UDP
-```
-
-Dentro Mininet:
-
-```text
-sh pkill iperf3
-
-h4 iperf3 -s -p 5201 -D
-h4 iperf3 -s -p 5202 -D
-h4 iperf3 -s -p 5203 -D
-
-h2 sh -c 'ping -D -i 0.5 -c 70 10.0.0.4 > /tmp/E2_ping_h2.txt 2>&1 &'
-
-h2 sh -c 'iperf3 -c 10.0.0.4 -u -b 2M -t 30 -p 5201 > /tmp/E2_h2.txt 2>&1 &'
-h3 sh -c 'iperf3 -c 10.0.0.4 -u -b 2M -t 30 -p 5202 > /tmp/E2_h3.txt 2>&1 &'
-
-sh sleep 10
-
-sh date +%s.%N > /tmp/E2_attack_start.txt
-
-h1 sh -c 'iperf3 -c 10.0.0.4 -u -b 20M -t 15 -p 5203 > /tmp/E2_h1_attack.txt 2>&1 &'
-
-sh sleep 15
-sh sleep 12
-
-sh cp /tmp/E2_ping_h2.txt results/raw/E2_ping_h2.txt
-sh cp /tmp/E2_h2.txt results/raw/E2_h2.txt
-sh cp /tmp/E2_h3.txt results/raw/E2_h3.txt
-sh cp /tmp/E2_h1_attack.txt results/raw/E2_h1_attack.txt
-sh cp /tmp/E2_attack_start.txt results/raw/E2_attack_start.txt
-```
-
-Per il dataset finale, la fine canonica dell'attacco E2 è:
-
-```text
-attack_end = attack_start + 15 s
-```
-
-perché il timestamp di fine della prima esecuzione sperimentale era stato raccolto manualmente in ritardo.
-
----
-
-## 10. Scenario E3 — DoS con protezione
-
-E3 mantiene la stessa topologia, lo stesso traffico e la stessa durata di E2.
-
-L'unica differenza concettuale è il controller custom.
-
-Avviare:
-
-```bash
-RUN_ID=E3 \
-ryu-manager \
-    --ofp-tcp-listen-port 6653 \
-    controller/dos_controller.py
-```
-
-Poi, dentro Mininet:
-
-```text
-sh pkill iperf3
-
-h4 iperf3 -s -p 5201 -D
-h4 iperf3 -s -p 5202 -D
-h4 iperf3 -s -p 5203 -D
-
-h2 sh -c 'ping -D -i 0.5 -c 70 10.0.0.4 > /tmp/E3_ping_h2.txt 2>&1 &'
-
-h2 sh -c 'iperf3 -c 10.0.0.4 -u -b 2M -t 30 -p 5201 > /tmp/E3_h2.txt 2>&1 &'
-h3 sh -c 'iperf3 -c 10.0.0.4 -u -b 2M -t 30 -p 5202 > /tmp/E3_h3.txt 2>&1 &'
-
-sh sleep 10
-
-h1 sh -c 'date +%s.%N > /tmp/E3_attack_start.txt; (sleep 15; date +%s.%N > /tmp/E3_attack_end.txt) & iperf3 -c 10.0.0.4 -u -b 20M -t 15 -p 5203 > /tmp/E3_h1_attack.txt 2>&1 &'
-
-sh sleep 27
-
-sh cp /tmp/E3_ping_h2.txt results/raw/E3_ping_h2.txt
-sh cp /tmp/E3_h2.txt results/raw/E3_h2.txt
-sh cp /tmp/E3_h3.txt results/raw/E3_h3.txt
-sh cp /tmp/E3_h1_attack.txt results/raw/E3_h1_attack.txt
-sh cp /tmp/E3_attack_start.txt results/raw/E3_attack_start.txt
-sh cp /tmp/E3_attack_end.txt results/raw/E3_attack_end.txt
-```
-
-Verifica della detection:
-
-```text
-sh grep DROP_INSTALLED results/raw/E3_controller.csv
-```
-
-Deve esistere almeno una riga con:
-
-```text
-DROP_INSTALLED
-```
-
----
-
-## 11. Analisi dei dati
-
-Disattivare il virtual environment Ryu:
-
-```bash
-deactivate 2>/dev/null || true
-```
-
-Eseguire il parser:
-
-```bash
-cd ~/ncis-project
-python3 experiments/parse_results.py
-```
-
-Il parser genera:
-
-```text
-results/rtt_samples.csv
-results/controller_port1.csv
-results/events.csv
-results/summary.csv
-```
-
-Controllo:
-
-```bash
-column -s, -t < results/summary.csv
-column -s, -t < results/events.csv
-```
-
----
-
-## 12. Grafici
-
-Generazione:
-
-```bash
-python3 experiments/plots.py
-```
-
-Output:
-
-```text
-results/plots/rtt_over_time.png
-results/plots/goodput_summary.png
-results/plots/attacker_port_rate.png
-```
-
-### `rtt_over_time.png`
-
-Confronta E2 ed E3 usando l'inizio dell'attacco come riferimento temporale.
-
-E1 viene rappresentato tramite la propria baseline media.
-
-Il grafico evidenzia:
-
-- forte aumento dell'RTT durante il DoS;
-- detection e DROP in E3;
-- recupero progressivo del traffico legittimo dopo la mitigazione.
-
-### `goodput_summary.png`
-
-Confronta:
-
-- goodput aggregato di `h2 + h3`;
-- goodput dell'attaccante effettivamente ricevuto da `h4`.
-
-### `attacker_port_rate.png`
-
-Mostra il rate RX misurato sulla porta `s1-eth1`, la soglia e l'istante di `DROP_INSTALLED`.
-
-Il rate RX della porta 1 **non deve necessariamente diminuire dopo il DROP**: i pacchetti vengono prima ricevuti sulla porta fisica e conteggiati nei relativi contatori, quindi scartati dalla pipeline OpenFlow.
-
----
-
-## 13. Risultati
-
-Risultati delle esecuzioni utilizzate nel progetto:
-
-| Scenario | RTT medio h2→h4 | RTT max | Goodput legittimo totale | Attacker goodput ricevuto da h4 |
-|---|---:|---:|---:|---:|
-| E1 | 0.127 ms | 3.56 ms | 4.00 Mbit/s | N/A |
-| E2 | 114.947 ms | 339 ms | 3.74 Mbit/s | 2.05 Mbit/s |
-| E3 | 91.341 ms | 339 ms | 4.00 Mbit/s | 0.348 Mbit/s |
-
-In E3:
-
-```text
-detection delay ≈ 5.549 s
-```
-
-La mitigazione porta quindi:
-
-- il goodput legittimo da **3.74 Mbit/s a 4.00 Mbit/s**;
-- il traffico dell'attaccante ricevuto da `h4` da **2.05 Mbit/s a 0.348 Mbit/s**;
-- una riduzione del traffico dell'attaccante ricevuto dalla vittima di circa **83%**;
-- un recupero progressivo dell'RTT del traffico legittimo dopo il DROP.
-
-L'RTT massimo rimane elevato anche in E3 perché la detection non è istantanea e la coda già accumulata sul bottleneck deve essere smaltita.
-
----
-
-## 14. Interpretazione della mitigazione
-
-Il comportamento osservato in E3 è:
-
-```text
-attacco
-   ↓
-congestione del bottleneck
-   ↓
-RTT elevato
-   ↓
-3 campioni sopra soglia
-   ↓
-DROP_INSTALLED su in_port=1
-   ↓
-nuovo traffico di h1 non raggiunge più h4
-   ↓
-svuotamento della coda
-   ↓
-recupero del traffico legittimo
-```
-
-Il controller utilizza statistiche **ingress** sulla porta 1.
-
-Pertanto, dopo il DROP, `rx_bytes` può continuare ad aumentare: il DROP viene applicato nella pipeline OpenFlow dopo che il frame è già arrivato fisicamente sulla porta.
-
-La riuscita della mitigazione va quindi valutata considerando congiuntamente:
-
-- presenza di `DROP_INSTALLED`;
-- riduzione dell'attacker goodput ricevuto da `h4`;
-- recupero del goodput legittimo;
-- recupero dell'RTT nel tempo.
-
----
-
-## 15. Limiti
-
-Il progetto presenta volutamente alcune semplificazioni:
-
-- soglia statica;
-- topologia nota a priori;
-- porta dell'attaccante nota (`s1-eth1`);
-- singolo attaccante;
-- solo traffico UDP volumetrico;
-- nessuna distinzione tra heavy hitter legittimo e attaccante;
-- nessuna classificazione avanzata;
-- nessun machine learning;
-- nessun meccanismo distribuito per DDoS;
-- mitigazione coarse-grained: viene bloccato tutto il traffico proveniente da `in_port=1`;
-- il threshold è calibrato sullo specifico scenario sperimentale.
-
-Il sistema deve quindi essere considerato un **proof of concept didattico**, non un IDS/IPS general-purpose.
-
----
-
-## 16. Struttura della repository
-
-```text
-ncis-project/
-├── controller/
-│   └── dos_controller.py
-├── topology/
-│   └── simple_dos_topo.py
-├── traffic/
-│   └── mark_event.sh
-├── experiments/
-│   ├── parse_results.py
-│   └── plots.py
-├── results/
-│   ├── raw/
-│   ├── plots/
-│   │   ├── rtt_over_time.png
-│   │   ├── goodput_summary.png
-│   │   └── attacker_port_rate.png
-│   ├── rtt_samples.csv
-│   ├── controller_port1.csv
-│   ├── events.csv
-│   └── summary.csv
-├── requirements-lock.txt
-└── README.md
-```
-
----
-
-## 17. Sequenza operativa raccomandata
-
-### Inizio test
+### Controller
 
 Terminale 1:
 
 ```bash
-sudo mn -c
 cd ~/ncis-project
 source ~/ryuenv/bin/activate
-ryu-manager ...
+RUN_ID=FINAL_A ryu-manager --ofp-tcp-listen-port 6653 controller/dos_controller.py
 ```
+
+### Mininet
 
 Terminale 2:
 
 ```bash
 cd ~/ncis-project
-sudo python3 topology/simple_dos_topo.py
+sudo python3 topology/overblocking_topo.py
 ```
 
-### Fine test
+Verifica:
 
-Dentro Mininet:
+```text
+pingall
+```
+
+Risultato atteso:
+
+```text
+*** Results: 0% dropped
+```
+
+---
+
+## 11. Validazione finale
+
+Le evidenze finali sono conservate in:
+
+```text
+results/final/
+```
+
+### FINAL-A — Adaptive detection, targeted mitigation e intelligent unblock
+
+FINAL-A verifica congiuntamente:
+
+- stabilità della baseline adattiva;
+- threshold dinamico;
+- detection;
+- targeted DROP;
+- assenza di over-blocking;
+- persistenza del blocco mentre l'attacco continua;
+- intelligent unblock dopo la cessazione del traffico.
+
+Risultati:
+
+| Metrica | Risultato |
+|---|---:|
+| Baseline dopo training | **2.044 Mbit/s** |
+| Threshold adattivo | **3.066 Mbit/s** |
+| Detection delay | **5.608 s** |
+| Durata della flow di DROP | **58.919 s** |
+| Unblock dopo la fine del traffico | **4.526 s** |
+| Packet loss `h1` durante mitigazione | **100%** |
+| Packet loss `h5` durante mitigazione | **0%** |
+| Packet loss `h2` durante mitigazione | **0%** |
+| Packet loss `h1` dopo unblock | **0%** |
+
+Flow automatica osservata:
+
+```text
+priority=100,ip,in_port=1,nw_src=10.0.0.1 actions=drop
+```
+
+La regola resta presente ben oltre il vecchio timeout fisso di 20 s quando l'attacco continua e viene rimossa solo dopo l'osservazione di traffico quiet.
+
+### FINAL-B — Allowlist e blocklist runtime
+
+FINAL-B verifica le policy amministrative sulla sorgente `h5 = 10.0.0.5`.
+
+| Condizione | Packet loss h5 | Comportamento |
+|---|---:|---|
+| Allowlist ON + high-rate traffic | **0%** | `ALLOWLIST_SUPPRESSED`, nessun DROP automatico |
+| Allowlist OFF + stesso high-rate traffic | **100%** | DROP automatico `priority=100` |
+| Blocklist ON | **100%** | DROP amministrativo `priority=110` |
+| Blocklist OFF | **0%** | policy amministrativa rimossa |
+
+Durante il blocco amministrativo di `h5`:
+
+```text
+h1 packet loss = 0%
+h2 packet loss = 0%
+```
+
+La policy è quindi selettiva.
+
+---
+
+## 12. Dataset e grafici finali
+
+Dataset:
+
+```text
+results/final/summary.csv
+results/final/improvements.csv
+results/final/raw/FINAL_A_controller.csv
+results/final/raw/FINAL_B_controller.csv
+```
+
+Generazione grafici:
+
+```bash
+python3 scripts/generate_final_plots.py
+```
+
+Output:
+
+```text
+results/final/plots/final_a_adaptive_detection.png
+results/final/plots/final_a_adaptive_threshold_zoom.png
+results/final/plots/final_a_selectivity.png
+results/final/plots/final_b_policy_effects.png
+```
+
+### Adaptive detection
+
+`final_a_adaptive_detection.png` mostra:
+
+- rate misurato;
+- baseline adattiva;
+- threshold;
+- `DROP_INSTALLED`;
+- `DROP_REMOVED`.
+
+### Adaptive threshold zoom
+
+`final_a_adaptive_threshold_zoom.png` usa una vista verticale 0–6 Mbit/s per rendere leggibili baseline e threshold.
+
+### Selective mitigation
+
+`final_a_selectivity.png` mostra:
+
+```text
+h1 attacker     100% loss
+h5 legitimate     0% loss
+h2 legitimate     0% loss
+```
+
+### Runtime policies
+
+`final_b_policy_effects.png` mostra:
+
+```text
+Allowlist ON      0%
+Allowlist OFF   100%
+Blocklist ON    100%
+Blocklist OFF     0%
+```
+
+---
+
+## 13. Struttura del repository
+
+File principali:
+
+```text
+controller/
+  dos_controller.py
+
+topology/
+  overblocking_topo.py
+  simple_dos_topo.py
+
+policy/
+  blocklist.json
+
+scripts/
+  generate_final_plots.py
+
+results/
+  final/
+    summary.csv
+    improvements.csv
+    raw/
+      FINAL_A_controller.csv
+      FINAL_B_controller.csv
+    plots/
+      final_a_adaptive_detection.png
+      final_a_adaptive_threshold_zoom.png
+      final_a_selectivity.png
+      final_b_policy_effects.png
+
+requirements-lock.txt
+README.md
+```
+
+I file e gli esperimenti della baseline rimangono nel repository come traccia dell'evoluzione del progetto.
+
+---
+
+## 14. Evoluzione rispetto alla baseline
+
+La versione iniziale utilizzava:
+
+```text
+threshold statico = 1.5 Mbit/s
+3 hit consecutivi
+DROP generico per in_port
+hard_timeout = 20 s
+```
+
+La versione finale utilizza invece:
+
+```text
+training benigno
+        |
+        v
+adaptive baseline + EWMA
+        |
+        v
+dynamic threshold
+        |
+        v
+3 hit consecutivi
+        |
+        v
+source identification
+        |
+        v
+targeted DROP per IPv4
+        |
+        v
+traffic-aware intelligent unblock
+```
+
+A questa pipeline automatica si affianca:
+
+```text
+external JSON policy
+      |
+      +--> blocked_ipv4 ----> persistent admin DROP
+      |
+      +--> allowlisted_ipv4 -> suppress automatic mitigation
+```
+
+---
+
+## 15. Limiti
+
+Il progetto rimane un proof of concept didattico.
+
+La validazione finale è focalizzata su:
+
+- attacchi DoS volumetrici;
+- identificazione di una sorgente heavy-hitter;
+- porte host-facing con una singola sorgente appresa;
+- topologia a due switch;
+- controllo centralizzato Ryu/OpenFlow.
+
+Non vengono affrontati in questa versione:
+
+- DDoS distribuito multi-sorgente;
+- attacchi stealthy / low-rate;
+- classificazione ML;
+- entropy-based detection;
+- autenticazione o firma del file di policy;
+- deployment multi-controller;
+- valutazioni su topologie di larga scala.
+
+Questi aspetti rappresentano possibili estensioni future.
+
+---
+
+## 16. Cleanup
+
+A fine esperimento:
+
+1. uscire da Mininet:
 
 ```text
 exit
 ```
 
-Nel terminale Ryu:
+2. terminare Ryu con:
 
 ```text
 Ctrl+C
 ```
 
-Poi:
+3. eseguire:
 
 ```bash
 sudo mn -c
 ```
 
-**Non eseguire `sudo mn -c` mentre Ryu deve rimanere attivo.**
+La sequenza consigliata è:
+
+```text
+sudo mn -c
+    |
+    v
+start Ryu
+    |
+    v
+start Mininet
+    |
+    v
+experiment
+    |
+    v
+exit Mininet
+    |
+    v
+Ctrl+C Ryu
+    |
+    v
+sudo mn -c
+```
